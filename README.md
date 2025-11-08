@@ -139,3 +139,35 @@ pytest >= "8.4.1"
 ```
 
 <img src="docs/logos.png" alt="" width="200"/>
+
+## Week-6 nearsightedness metric package
+
+This repository now bundles a light-weight implementation of the Week-6 nearsightedness metric in `nearsighted/`.  The package provides the grid utilities, Hartree helper, Kohn–Sham reconstruction tools, and CLI scripts requested in the Week-6 specification.
+
+### Running the tests
+
+All tests (unit, physics acceptance, and CLI smoke tests) run with:
+
+```
+pytest -q
+```
+
+The acceptance suite validates three reference systems:
+
+* **Single electron (`u`) harmonic trap** – verifies `v_{xc} = -v_H`, checks that the Hartree + XC potential vanishes (after gauge removal), and demands `M_{ratio}` and `M_{residual}` below `1e-8`.
+* **Two-electron singlet (`ud`)** – enforces `v_x = -½ v_H`, ensures the nearsightedness metrics collapse for the soft-Coulomb large-λ limit, and performs a grid-refinement study between 201 and 251 points (relative change < 2%).
+* **Two-electron spin-polarised (`uu`)** – constructs the non-interacting reference with two occupied KS orbitals and requires `M_{ratio}` and `M_{residual}` below `1e-4` while confirming the KS decomposition.
+
+### CLI tools
+
+Two executable scripts live in `bin/`:
+
+* `compute_metric.py` loads `x`, `n`, and potential components from `.npz`/CSV and writes a single-row CSV containing all diagnostics defined in the specification.
+* `make_dataset.py` sweeps over simple harmonic-oscillator systems (various `k`, `λ`, grid sizes, and spin configurations) to generate tidy CSV summaries and matching `.npz` dumps.
+
+### Do **NOT**
+
+* Do **not** define `v_{hxc}` as `v_s - v_ext` except when explicitly using the `sanity_vs_minus_vext` diagnostic path.
+* Do **not** assume a single orbital wavefunction `ψ = √(n/2)` outside of the `N=2` singlet scenario—never for the spin-polarised `uu` configuration.
+* Do **not** compare potentials without first removing gauge constants; all ∞-norm checks subtract the mean (or weighted mean) before evaluation.
+* Do **not** deviate from second-order **central differences** for all spatial derivatives.
