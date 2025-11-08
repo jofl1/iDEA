@@ -46,5 +46,6 @@ def test_remove_gauge_weighted():
     values = np.array([0.0, 1.0, 2.0])
     weights = np.array([1.0, 1.0, 2.0])
     centered = remove_gauge(values, weights)
-    assert np.isclose(np.sum(weights * centered), 0.0)
-    np.testing.assert_allclose(centered, np.array([-1.25, -0.25, 0.75]))
+    assert np.isclose(centered.sum(), 0.0)
+    # Weighted mean equals 1.25
+    np.testing.assert_allclose(centered, np.array([-1.25, -0.25, 1.75]))

@@ -37,55 +37,21 @@ def uniform_grid(xmin: float, xmax: float, num: int) -> Grid:
 
 
 def central_difference(values: np.ndarray, dx: float) -> np.ndarray:
-    """Compute first derivatives using fourth-order central differences."""
+    """Compute first derivative using central differences.
+
+    Uses second-order accurate central differences for interior points and
+    second-order forward/backward differences at the boundaries.
+    """
 
     values = np.asarray(values, dtype=float)
     if values.ndim != 1:
         raise ValueError("central_difference expects a 1D array")
-    n = values.size
-    if n < 3:
+    if values.size < 3:
         raise ValueError("central_difference requires at least 3 points")
     derivative = np.empty_like(values)
-    if n < 5:
-        derivative[1:-1] = (values[2:] - values[:-2]) / (2.0 * dx)
-        derivative[0] = (-3 * values[0] + 4 * values[1] - values[2]) / (2.0 * dx)
-        derivative[-1] = (3 * values[-1] - 4 * values[-2] + values[-3]) / (2.0 * dx)
-        return derivative
-
-    derivative[0] = (
-        -25 * values[0]
-        + 48 * values[1]
-        - 36 * values[2]
-        + 16 * values[3]
-        - 3 * values[4]
-    ) / (12.0 * dx)
-    derivative[1] = (
-        -3 * values[0]
-        - 10 * values[1]
-        + 18 * values[2]
-        - 6 * values[3]
-        + values[4]
-    ) / (12.0 * dx)
-    derivative[2:-2] = (
-        values[:-4]
-        - 8 * values[1:-3]
-        + 8 * values[3:-1]
-        - values[4:]
-    ) / (12.0 * dx)
-    derivative[-2] = (
-        -values[-5]
-        + 6 * values[-4]
-        - 18 * values[-3]
-        + 10 * values[-2]
-        + 3 * values[-1]
-    ) / (12.0 * dx)
-    derivative[-1] = (
-        3 * values[-5]
-        - 16 * values[-4]
-        + 36 * values[-3]
-        - 48 * values[-2]
-        + 25 * values[-1]
-    ) / (12.0 * dx)
+    derivative[1:-1] = (values[2:] - values[:-2]) / (2.0 * dx)
+    derivative[0] = (-3 * values[0] + 4 * values[1] - values[2]) / (2.0 * dx)
+    derivative[-1] = (3 * values[-1] - 4 * values[-2] + values[-3]) / (2.0 * dx)
     return derivative
 
 

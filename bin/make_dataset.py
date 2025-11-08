@@ -6,15 +6,10 @@ import argparse
 import csv
 import pathlib
 import subprocess
-import sys
 from datetime import datetime
 from typing import Iterable, List
 
 import numpy as np
-
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from nearsighted.grids import uniform_grid
 from nearsighted.hartree import v_H_from_density
