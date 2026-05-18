@@ -248,10 +248,176 @@ def _build_solver_components(s: iDEA.system.System) -> _SolverComponents:
     return comps
 
 
+def _v_ext_is_parity_symmetric(s: iDEA.system.System, atol: float = 1e-10) -> bool:
+    return bool(np.allclose(s.v_ext, s.v_ext[::-1], atol=atol))
+
+
+def _v_int_is_parity_symmetric(s: iDEA.system.System, atol: float = 1e-10) -> bool:
+    return bool(np.allclose(s.v_int, s.v_int[::-1, ::-1], atol=atol))
+
+
+def _reflect_comb(comb, n_grid):
+    return tuple(sorted(n_grid - 1 - i for i in comb))
+
+
+def _reflection_sign(n_up: int, n_down: int) -> int:
+    """epsilon_{N_up} * epsilon_{N_down} where epsilon_m = (-1)^(m(m-1)/2).
+
+    Comes from reordering m reversed creation operators back into sorted
+    order: removing each excess transposition contributes one fermionic
+    sign. The friend's correction — easy to miss and the source of the
+    'uu has odd ground state' result.
+    """
+    eps_up = -1 if (n_up * (n_up - 1) // 2) % 2 else 1
+    eps_down = -1 if (n_down * (n_down - 1) // 2) % 2 else 1
+    return eps_up * eps_down
+
+
+def _predict_ground_parity(s: iDEA.system.System) -> int:
+    """Predicted ground-state total parity per the friend's formula."""
+    return _reflection_sign(s.up_count, s.down_count)
+
+
+def _build_parity_orbits(comps: _SolverComponents, n_grid: int, n_up: int, n_down: int):
+    """Build the joint-state parity orbit map and per-block representative lists.
+
+    Returns:
+        s_ref: int, sign of joint reflection = eps_{N_up} * eps_{N_down}.
+        partner: int64 array of length D, partner[i] = joint index of the
+            parity reflection of joint index i.
+        self_mask: bool array, True where partner[i] == i (self-orbit).
+        reps_pos, reps_neg: int64 arrays, orbit representatives in the
+            +1 and -1 total-parity blocks respectively.
+
+    For pair-orbits, the lower joint index of {i, partner[i]} is used as
+    the canonical representative; it appears in both blocks (one even
+    combination, one odd). For self-orbits, the orbit lives only in the
+    block p = s_ref.
+    """
+    D_up = comps.D_up
+    D_down = comps.D_down
+    D = comps.D
+    s_ref = _reflection_sign(n_up, n_down)
+
+    up_ref = np.empty(D_up, dtype=np.int64)
+    for u_idx, comb in enumerate(comps.up_combs):
+        if comb:
+            up_ref[u_idx] = comps.up_rank[_reflect_comb(comb, n_grid)]
+        else:
+            up_ref[u_idx] = 0
+
+    down_ref = np.empty(D_down, dtype=np.int64)
+    for d_idx, comb in enumerate(comps.down_combs):
+        if comb:
+            down_ref[d_idx] = comps.down_rank[_reflect_comb(comb, n_grid)]
+        else:
+            down_ref[d_idx] = 0
+
+    partner = np.empty(D, dtype=np.int64)
+    for u_idx in range(D_up):
+        for d_idx in range(D_down):
+            joint = u_idx * D_down + d_idx
+            partner[joint] = up_ref[u_idx] * D_down + down_ref[d_idx]
+
+    self_mask = partner == np.arange(D)
+
+    reps_pos = []
+    reps_neg = []
+    seen = np.zeros(D, dtype=bool)
+    for i in range(D):
+        if seen[i]:
+            continue
+        j = int(partner[i])
+        if i == j:
+            if s_ref == 1:
+                reps_pos.append(i)
+            else:
+                reps_neg.append(i)
+            seen[i] = True
+        else:
+            rep = min(i, j)
+            reps_pos.append(rep)
+            reps_neg.append(rep)
+            seen[i] = True
+            seen[j] = True
+
+    return (
+        s_ref,
+        partner,
+        self_mask,
+        np.array(reps_pos, dtype=np.int64),
+        np.array(reps_neg, dtype=np.int64),
+    )
+
+
+def _build_parity_projection(reps, partner, self_mask, s_ref, p, D):
+    """Sparse projector Q_p mapping a block-coordinate vector to full basis.
+
+    For self-orbit reps i (only present when p == s_ref): Q_p[i, k] = 1.
+    For pair-orbit reps i with partner j != i:
+        Q_p[i, k] = 1/sqrt(2), Q_p[j, k] = p*s_ref/sqrt(2).
+    """
+    rows = []
+    cols = []
+    data = []
+    sqrt2_inv = 1.0 / np.sqrt(2.0)
+    for k, i in enumerate(reps):
+        if self_mask[i]:
+            rows.append(int(i))
+            cols.append(k)
+            data.append(1.0)
+        else:
+            j = int(partner[i])
+            rows.append(int(i))
+            cols.append(k)
+            data.append(sqrt2_inv)
+            rows.append(j)
+            cols.append(k)
+            data.append(p * s_ref * sqrt2_inv)
+    return sps.csr_matrix((data, (rows, cols)), shape=(D, len(reps)), dtype=float)
+
+
+def _solve_in_parity_block(comps, Q_p, k=0, tol=0.0):
+    """Run eigsh on Q_p^T H Q_p (the friend's 'implicit projector' form).
+
+    Returns (energies[: k+1], eigvecs in full basis[:, : k+1]).
+    """
+    D_block = Q_p.shape[1]
+    if D_block == 0:
+        return np.array([], dtype=float), np.zeros((comps.D, 0))
+
+    n_eig = k + 1
+
+    def matvec_block(y):
+        return Q_p.T @ comps.matvec(Q_p @ y)
+
+    if n_eig >= D_block - 1:
+        dense = np.empty((D_block, D_block), dtype=float)
+        for col in range(D_block):
+            e = np.zeros(D_block)
+            e[col] = 1.0
+            dense[:, col] = matvec_block(e)
+        energies, eigvecs = np.linalg.eigh(dense)
+        eigvecs_full = Q_p @ eigvecs[:, :n_eig]
+        return energies[:n_eig], eigvecs_full
+
+    op_block = spsla.LinearOperator(
+        shape=(D_block, D_block), matvec=matvec_block, dtype=float
+    )
+    energies, eigvecs = spsla.eigsh(op_block, k=n_eig, which="SA", tol=tol)
+    order = np.argsort(energies)
+    energies = energies[order]
+    eigvecs = eigvecs[:, order]
+    eigvecs_full = Q_p @ eigvecs
+    return energies, eigvecs_full
+
+
 def solve(
     s: iDEA.system.System,
     k: int = 0,
     tol: float = 0.0,
+    use_parity: bool = True,
+    verify_parity: bool = True,
 ) -> iDEA.state.ManyBodyState:
     """Solve the interacting Schrödinger equation in determinant basis.
 
@@ -259,12 +425,20 @@ def solve(
     |     s: iDEA.system.System, System object.
     |     k: int, Energy level to return (0 = ground state).
     |     tol: float, eigsh tolerance (0 = machine precision).
+    |     use_parity: bool, opt out of parity block-diagonalisation
+    |         (forces the full-basis solve; default True).
+    |     verify_parity: bool, when True (default for Phase C correctness)
+    |         solves BOTH parity blocks and merges by energy. Phase C+
+    |         flips the default to False to enable the predicted-block
+    |         fast path.
 
     | Returns:
     |     state: iDEA.state.ManyBodyState with .energy, .det_amplitudes,
-    |     .det_up_combs, .det_down_combs, .det_up_indicator, .det_down_indicator.
-    |     .full / .space / .spin are intentionally left as ArrayPlaceholder
-    |     in Phase B; use iDEA.methods.interacting_det.density() for the
+    |     and .det_up_combs / .det_down_combs / .det_up_indicator /
+    |     .det_down_indicator. When parity was used, .parity is set to
+    |     +1 or -1 (the parity of the returned eigenstate). .full /
+    |     .space / .spin are intentionally left as ArrayPlaceholder in
+    |     Phase B/C; use iDEA.methods.interacting_det.density() for the
     |     density observable.
     """
     comps = _build_solver_components(s)
@@ -272,25 +446,62 @@ def solve(
     D_up = comps.D_up
     D_down = comps.D_down
 
-    n_eig = k + 1
-    if n_eig >= D - 1:
-        # eigsh requires k < D - 1; for tiny problems just densify.
-        dense = np.empty((D, D), dtype=float)
-        for col in range(D):
-            e = np.zeros(D)
-            e[col] = 1.0
-            dense[:, col] = comps.matvec(e)
-        energies, eigvecs = np.linalg.eigh(dense)
-        eigvecs = eigvecs[:, : k + 1]
-        energies = energies[: k + 1]
-    else:
-        energies, eigvecs = spsla.eigsh(comps.op, k=n_eig, which="SA", tol=tol)
-        order = np.argsort(energies)
-        energies = energies[order]
-        eigvecs = eigvecs[:, order]
+    can_use_parity = (
+        use_parity
+        and _v_ext_is_parity_symmetric(s)
+        and _v_int_is_parity_symmetric(s)
+    )
 
-    eigval = float(energies[k])
-    amplitudes = eigvecs[:, k].reshape(D_up, D_down)
+    if can_use_parity:
+        n_grid = s.x.shape[0]
+        n_up = s.up_count
+        n_down = s.down_count
+        s_ref, partner, self_mask, reps_pos, reps_neg = _build_parity_orbits(
+            comps, n_grid, n_up, n_down
+        )
+        Q_pos = _build_parity_projection(reps_pos, partner, self_mask, s_ref, +1, D)
+        Q_neg = _build_parity_projection(reps_neg, partner, self_mask, s_ref, -1, D)
+
+        # Commit 2 default: solve both blocks and merge by energy.
+        energies_pos, eigvecs_pos = _solve_in_parity_block(comps, Q_pos, k=k, tol=tol)
+        energies_neg, eigvecs_neg = _solve_in_parity_block(comps, Q_neg, k=k, tol=tol)
+
+        all_energies = np.concatenate([energies_pos, energies_neg])
+        all_eigvecs = np.concatenate([eigvecs_pos, eigvecs_neg], axis=1)
+        parities = np.concatenate(
+            [np.full(len(energies_pos), +1), np.full(len(energies_neg), -1)]
+        )
+        order = np.argsort(all_energies)
+        eigval = float(all_energies[order[k]])
+        amplitudes = all_eigvecs[:, order[k]].reshape(D_up, D_down)
+        selected_parity = int(parities[order[k]])
+
+        if verify_parity and k == 0:
+            predicted = _predict_ground_parity(s)
+            assert selected_parity == predicted, (
+                f"ground-state parity mismatch: solver returned {selected_parity}, "
+                f"prediction (eps_Nup * eps_Ndown) is {predicted}"
+            )
+    else:
+        # Full-basis fallback for asymmetric systems or use_parity=False.
+        n_eig = k + 1
+        if n_eig >= D - 1:
+            dense = np.empty((D, D), dtype=float)
+            for col in range(D):
+                e = np.zeros(D)
+                e[col] = 1.0
+                dense[:, col] = comps.matvec(e)
+            energies, eigvecs = np.linalg.eigh(dense)
+            eigvecs = eigvecs[:, :n_eig]
+            energies = energies[:n_eig]
+        else:
+            energies, eigvecs = spsla.eigsh(comps.op, k=n_eig, which="SA", tol=tol)
+            order = np.argsort(energies)
+            energies = energies[order]
+            eigvecs = eigvecs[:, order]
+        eigval = float(energies[k])
+        amplitudes = eigvecs[:, k].reshape(D_up, D_down)
+        selected_parity = 0  # parity unknown / not applicable
 
     state = iDEA.state.ManyBodyState(energy=eigval)
     state.det_amplitudes = amplitudes
@@ -298,6 +509,7 @@ def solve(
     state.det_down_combs = comps.down_combs
     state.det_up_indicator = comps.up_indicator
     state.det_down_indicator = comps.down_indicator
+    state.parity = selected_parity
     return state
 
 

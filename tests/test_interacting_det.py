@@ -189,3 +189,93 @@ def test_determinant_matches_dense_full_solve(electrons):
         f"dense_antisym={ref_energy:.16e} "
         f"diff={abs(state_det.energy - ref_energy):.6e}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase C parity tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    ["interacting_uu_80", "interacting_uud_60", "interacting_uudd_30"],
+)
+def test_parity_reflection_is_involutive(case_name):
+    """P(P(comb)) == comb for every comb in both spin channels."""
+    benchmark = _load_benchmark_module()
+    s = benchmark.CASES[case_name]()
+    n_grid = s.x.shape[0]
+    comps = det._build_solver_components(s)
+    for comb in comps.up_combs:
+        assert det._reflect_comb(det._reflect_comb(comb, n_grid), n_grid) == comb
+    for comb in comps.down_combs:
+        assert det._reflect_comb(det._reflect_comb(comb, n_grid), n_grid) == comb
+
+
+def test_parity_commutes_with_hamiltonian():
+    """[H, P] = 0 on five random vectors for uu_80."""
+    benchmark = _load_benchmark_module()
+    s = benchmark.CASES["interacting_uu_80"]()
+    n_grid = s.x.shape[0]
+    comps = det._build_solver_components(s)
+    s_ref, partner, _, _, _ = det._build_parity_orbits(
+        comps, n_grid, s.up_count, s.down_count
+    )
+
+    def apply_P(x):
+        return s_ref * x[partner]
+
+    rng = np.random.default_rng(seed=0)
+    for _ in range(5):
+        x = rng.standard_normal(comps.D)
+        commutator = comps.op @ apply_P(x) - apply_P(comps.op @ x)
+        nrm = float(np.linalg.norm(commutator)) / max(
+            float(np.linalg.norm(x)), 1e-300
+        )
+        assert nrm < 1e-10, f"||[H,P] x|| / ||x|| = {nrm:.6e}"
+
+
+_PREDICTED_PARITY = {
+    "interacting_uu_80": -1,
+    "interacting_uud_60": -1,
+    "interacting_uudd_30": +1,
+}
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    ["interacting_uu_80", "interacting_uud_60", "interacting_uudd_30"],
+)
+def test_ground_state_parity_matches_prediction(case_name):
+    """Friend's formula: p_gs = (-1)^(N_up*(N_up-1)/2 + N_down*(N_down-1)/2)."""
+    benchmark = _load_benchmark_module()
+    s = benchmark.CASES[case_name]()
+    assert det._predict_ground_parity(s) == _PREDICTED_PARITY[case_name]
+    # verify_parity=True asserts internally; a passing solve confirms the
+    # block selection matches the prediction.
+    state = det.solve(s, k=0, verify_parity=True)
+    assert state.parity == _PREDICTED_PARITY[case_name]
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    ["interacting_uu_80", "interacting_uud_60", "interacting_uudd_30"],
+)
+def test_parity_solver_matches_full_solver(case_name):
+    """Parity-enabled solve agrees with full-basis solve on energy and density."""
+    benchmark = _load_benchmark_module()
+    s = benchmark.CASES[case_name]()
+    state_parity = det.solve(s, k=0, use_parity=True, verify_parity=True)
+    state_full = det.solve(s, k=0, use_parity=False)
+    n_parity = det.density(s, state_parity)
+    n_full = det.density(s, state_full)
+    assert np.isclose(
+        state_parity.energy, state_full.energy, rtol=1e-10, atol=1e-12
+    ), (
+        f"{case_name}: parity={state_parity.energy:.16e} "
+        f"full={state_full.energy:.16e}"
+    )
+    assert np.allclose(n_parity, n_full, rtol=1e-10, atol=1e-12), (
+        f"{case_name}: density max diff "
+        f"{float(np.max(np.abs(n_parity - n_full))):.6e}"
+    )
