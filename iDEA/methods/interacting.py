@@ -247,7 +247,12 @@ def _estimate_level(s: iDEA.system.System, k: int) -> int:
 
 
 def solve(
-    s: iDEA.system.System, H: np.ndarray = None, k: int = 0, level=None, GPU=False
+    s: iDEA.system.System,
+    H: np.ndarray = None,
+    k: int = 0,
+    level=None,
+    GPU=False,
+    bypass_det: bool = False,
 ) -> Union[iDEA.state.ManyBodyState, iDEA.state.ManyBodyStates]:
     r"""
     Solves the interacting Schrodinger equation of the given system.
@@ -258,10 +263,37 @@ def solve(
     |     k: int, Energy state to solve for. If -1 will return all states. (default = 0, the ground-state)
     |     level: int. Max level of excitation to use when solving the Schrodinger equation.
     |     GPU: bool, Solve on GPU using cupy. If false will use scipy on CPU.
+    |     bypass_det: bool, force the legacy labelled-basis solver even when
+    |         the determinant-basis fast path applies. (default = False)
 
     | Returns:
     |     state: iDEA.state.ManyBodyState or iDEA.state.ManyBodyStates, Solved state, or collection of all solved states if k=-1.
+
+    | Notes:
+    |     By default (bypass_det=False), this dispatches to the much faster
+    |     iDEA.methods.interacting_det.solve when conditions allow (ground
+    |     state k=0, default Hamiltonian, CPU, electrons string contains
+    |     only 'u' and 'd'). The returned ManyBodyState has .energy, .space,
+    |     .spin, .full all populated for full backward compatibility with
+    |     existing observables. Set bypass_det=True to force the legacy
+    |     labelled-basis solver — e.g. for debugging, validation, or to
+    |     compare numerical paths.
     """
+    can_dispatch_to_det = (
+        not bypass_det
+        and k == 0
+        and H is None
+        and level is None
+        and not GPU
+        and all(c in "ud" for c in s.electrons)
+    )
+    if can_dispatch_to_det:
+        import iDEA.methods.interacting_det as _det
+
+        print("iDEA.methods.interacting.solve: solving via determinant-basis fast path...")
+        det_state = _det.solve(s, k=0)
+        return _det.build_labelled_state(s, det_state)
+
     # Construct the Hamiltonian.
     if H is None:
         H = hamiltonian(s, GPU=GPU)
