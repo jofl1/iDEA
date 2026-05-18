@@ -9,11 +9,12 @@ import scipy.sparse as sps
 from tqdm import tqdm
 
 import iDEA.observables
+import iDEA.methods.non_interacting
 import iDEA.state
 import iDEA.system
 
 
-def reverse(
+def _reverse_reference(
     s: iDEA.system.System,
     target_n: np.ndarray,
     method: Container,
@@ -70,6 +71,144 @@ def reverse(
     if silent is False:
         print()
     return s_fictitious
+
+
+def _solve_non_interacting_static(
+    s: iDEA.system.System,
+    initial: tuple,
+    K: np.ndarray,
+) -> iDEA.state.SingleBodyState:
+    """Solve the default non-interacting system while skipping unused density matrices."""
+    state = iDEA.state.SingleBodyState()
+    state.up.occupations = np.zeros(shape=s.x.shape)
+    state.up.occupations[: s.up_count] = 1.0
+    state.down.occupations = np.zeros(shape=s.x.shape)
+    state.down.occupations[: s.down_count] = 1.0
+
+    n_old = initial[0]
+    up_n_old = initial[1]
+    down_n_old = initial[2]
+    up_p_old = initial[4]
+    down_p_old = initial[5]
+
+    H_old, up_H_old, down_H_old = iDEA.methods.non_interacting.hamiltonian(
+        s, up_n_old, down_n_old, up_p_old, down_p_old, K=K
+    )
+    H, up_H, down_H = iDEA.methods.non_interacting.hamiltonian(
+        s, up_n_old, down_n_old, up_p_old, down_p_old, K=K
+    )
+    down_H += sps.spdiags(
+        1e-12 * s.x, np.array([0]), s.x.shape[0], s.x.shape[0]
+    ).toarray()
+
+    convergence = 1.0
+    count = 0
+    while convergence > 1e-10:
+        state = iDEA.methods.non_interacting.sc_step(s, state, up_H, down_H)
+
+        n, up_n, down_n = iDEA.observables.density(s, state, return_spins=True)
+
+        if count != 0:
+            n = 0.5 * n + (1.0 - 0.5) * n_old
+            up_n = 0.5 * up_n + (1.0 - 0.5) * up_n_old
+            down_n = 0.5 * down_n + (1.0 - 0.5) * down_n_old
+
+        H, up_H, down_H = iDEA.methods.non_interacting.hamiltonian(
+            s, up_n, down_n, up_p_old, down_p_old, K=K
+        )
+
+        convergence = np.sum(abs(n - n_old)) * s.dx
+
+        n_old = n
+        up_n_old = up_n
+        down_n_old = down_n
+
+        count += 1
+
+    state = iDEA.methods.non_interacting.add_occupations(s, state, 0)
+    return state
+
+
+def _reverse_non_interacting(
+    s: iDEA.system.System,
+    target_n: np.ndarray,
+    v_guess: np.ndarray = None,
+    mu: float = 1.0,
+    pe: float = 0.1,
+    tol: float = 1e-12,
+    silent: bool = False,
+) -> iDEA.state.State:
+    s_fictitious = copy.deepcopy(s)
+    if v_guess is not None:
+        s_fictitious.v_ext = v_guess
+    n = np.zeros(shape=s.x.shape)
+    up_n = np.zeros(shape=s.x.shape)
+    down_n = np.zeros(shape=s.x.shape)
+    p = np.zeros(shape=s.x.shape * 2)
+    up_p = np.zeros(shape=s.x.shape * 2)
+    down_p = np.zeros(shape=s.x.shape * 2)
+    target_n_pe = target_n**pe
+    K = iDEA.methods.non_interacting.kinetic_energy_operator(s_fictitious)
+    convergence = 1.0
+    while convergence > tol:
+        if silent is False:
+            print(
+                r"iDEA.reverse_engineering.reverse: convergence = {0:.5}, tolerance = {1:.5}".format(
+                    convergence, tol
+                ),
+                end="\r",
+            )
+        state = _solve_non_interacting_static(
+            s_fictitious,
+            initial=(n, up_n, down_n, p, up_p, down_p),
+            K=K,
+        )
+        n, up_n, down_n = iDEA.observables.density(
+            s_fictitious, state=state, return_spins=True
+        )
+        s_fictitious.v_ext += mu * (n**pe - target_n_pe)
+        convergence = np.sum(abs(n - target_n)) * s.dx
+    if silent is False:
+        print()
+    return s_fictitious
+
+
+def reverse(
+    s: iDEA.system.System,
+    target_n: np.ndarray,
+    method: Container,
+    v_guess: np.ndarray = None,
+    mu: float = 1.0,
+    pe: float = 0.1,
+    tol: float = 1e-12,
+    silent: bool = False,
+    **kwargs
+) -> iDEA.state.State:
+    r"""
+    Determines what ficticious system is needed for a given method, when solving the system, to produce a given target density.
+    If the given target density is from solving the interacting electron problem (iDEA.methods.interacting), and the method is the non-interacting electron solver (iDEA.methods.non_interacting)
+    the output is the Kohn-Sham system.
+
+    The iterative method used is defined by the following formula:
+    .. math:: \mathrm{V}_\mathrm{ext} \rightarrow \mu * (\mathrm{n}^p - \mathrm{target_n}^p)
+
+    | Args:
+    |     s: iDEA.system.System, System object.
+    |     target_n: np.ndarray, Target density to reverse engineer.
+    |     method: Container, The method used to solve the system.
+    |     v_guess: np.ndarray, The initial guess of the fictitious potential. (default = None)
+    |     mu: float = 1.0, Reverse engineering parameter mu. (default = 1.0)
+    |     pe: float = 0.1, Reverse engineering parameter p. (default = 0.1)
+    |     tol: float, Tollerance of convergence. (default = 1e-12)
+    |     silent: bool, Set to true to prevent printing. (default = False)
+    |     kwargs: Other arguments that will be given to the method's solve function.
+
+    | Returns:
+    |     s_fictitious: iDEA.system.System, fictitious system object.
+    """
+    if method is iDEA.methods.non_interacting and not kwargs:
+        return _reverse_non_interacting(s, target_n, v_guess, mu, pe, tol, silent)
+    return _reverse_reference(s, target_n, method, v_guess, mu, pe, tol, silent, **kwargs)
 
 
 def _residual(
