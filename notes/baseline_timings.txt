@@ -98,6 +98,61 @@ produce this case at all, and the determinant solver does it in under 2
 seconds with stable runs.
 
 ==============================================================================
+Phase C+ — determinant basis + parity fast path (single predicted block)
+==============================================================================
+
+Same matrix-free LinearOperator as Phase B but the solver now exploits
+spatial parity symmetry. Only the predicted ground-parity block is
+solved (the friend's formula
+p_gs = (-1)^(N_up*(N_up-1)/2 + N_down*(N_down-1)/2)),
+via the implicit-projector form eigsh(Q_p^T H Q_p).
+
+The implicit-projector matvec still scatters into the full basis on
+each step, so the speedup is bounded below the asymptotic 2x. The
+friend's prediction: "if the measured speedup is < 1.3x, that's the
+signal to schedule the compressed-basis follow-up (Phase C++) before
+moving to Phase D". We're right at the threshold.
+
+----- raw output of `python benchmarks/benchmark_interacting.py time --runs 3 --solver det` -----
+
+interacting_uu_80 (solver=det)
+  wall time median: 0.116s (3 runs, min=0.116s max=0.117s)
+  peak memory:      102.3 MB
+  energy:           0.7531826851
+  density integral: 2.000000
+
+interacting_uud_60 (solver=det)
+  wall time median: 0.871s (3 runs, min=0.866s max=0.872s)
+  peak memory:      138.4 MB
+  energy:           1.6251528746
+  density integral: 3.000000
+
+interacting_uudd_30 (solver=det)
+  wall time median: 1.264s (3 runs, min=1.232s max=1.277s)
+  peak memory:      216.9 MB
+  energy:           2.9201268311
+  density integral: 4.000000
+
+==============================================================================
+Phase B vs Phase C+ summary
+==============================================================================
+
+| Case               | Phase A wall | Phase B wall | Phase C+ wall | Cumulative |
+| ------------------ | -----------: | -----------: | ------------: | ---------: |
+| interacting_uu_80  |       0.166s |       0.122s |        0.116s |      1.43x |
+| interacting_uud_60 |      26.146s |       1.062s |        0.871s |      30.0x |
+| interacting_uudd_30|     (fails)  |       1.666s |        1.264s |        N/A |
+
+Phase C+ marginal speedups over Phase B: 1.05x (uu_80), 1.22x (uud_60),
+1.32x (uudd_30). Cumulative speedups from the labelled baseline are
+1.43x, 30.0x, and "infinite" (uudd_30 fails on the labelled solver).
+
+The next available step in friend-order is Phase C++ (compressed-basis
+parity matvec, no full-basis scatter) or Phase D (PRIMME with a
+diagonal Jacobi preconditioner). Friend predicted Phase D gives the
+biggest remaining lever (20x+ on repeated workloads).
+
+==============================================================================
 Validate solvers against committed baselines (rtol=1e-10)
 ==============================================================================
 

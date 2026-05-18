@@ -417,7 +417,7 @@ def solve(
     k: int = 0,
     tol: float = 0.0,
     use_parity: bool = True,
-    verify_parity: bool = True,
+    verify_parity: bool = False,
 ) -> iDEA.state.ManyBodyState:
     """Solve the interacting Schrödinger equation in determinant basis.
 
@@ -427,10 +427,12 @@ def solve(
     |     tol: float, eigsh tolerance (0 = machine precision).
     |     use_parity: bool, opt out of parity block-diagonalisation
     |         (forces the full-basis solve; default True).
-    |     verify_parity: bool, when True (default for Phase C correctness)
-    |         solves BOTH parity blocks and merges by energy. Phase C+
-    |         flips the default to False to enable the predicted-block
-    |         fast path.
+    |     verify_parity: bool, when True solves BOTH parity blocks and
+    |         merges by energy (asserts the ground parity matches the
+    |         friend's formula for ``k=0``). Default False uses the
+    |         Phase C+ fast path: solve only the predicted ground-parity
+    |         block. ``k > 0`` always forces the both-blocks path because
+    |         we don't predict excited-state parities.
 
     | Returns:
     |     state: iDEA.state.ManyBodyState with .energy, .det_amplitudes,
@@ -459,29 +461,40 @@ def solve(
         s_ref, partner, self_mask, reps_pos, reps_neg = _build_parity_orbits(
             comps, n_grid, n_up, n_down
         )
-        Q_pos = _build_parity_projection(reps_pos, partner, self_mask, s_ref, +1, D)
-        Q_neg = _build_parity_projection(reps_neg, partner, self_mask, s_ref, -1, D)
 
-        # Commit 2 default: solve both blocks and merge by energy.
-        energies_pos, eigvecs_pos = _solve_in_parity_block(comps, Q_pos, k=k, tol=tol)
-        energies_neg, eigvecs_neg = _solve_in_parity_block(comps, Q_neg, k=k, tol=tol)
-
-        all_energies = np.concatenate([energies_pos, energies_neg])
-        all_eigvecs = np.concatenate([eigvecs_pos, eigvecs_neg], axis=1)
-        parities = np.concatenate(
-            [np.full(len(energies_pos), +1), np.full(len(energies_neg), -1)]
-        )
-        order = np.argsort(all_energies)
-        eigval = float(all_energies[order[k]])
-        amplitudes = all_eigvecs[:, order[k]].reshape(D_up, D_down)
-        selected_parity = int(parities[order[k]])
-
-        if verify_parity and k == 0:
+        # Fast path: solve only the predicted-parity block for k=0 unless
+        # the caller asks to verify. k>0 always falls through to both
+        # blocks because we have no prediction for excited-state parities.
+        if (not verify_parity) and k == 0:
             predicted = _predict_ground_parity(s)
-            assert selected_parity == predicted, (
-                f"ground-state parity mismatch: solver returned {selected_parity}, "
-                f"prediction (eps_Nup * eps_Ndown) is {predicted}"
+            reps = reps_pos if predicted == +1 else reps_neg
+            Q_p = _build_parity_projection(reps, partner, self_mask, s_ref, predicted, D)
+            energies_p, eigvecs_p = _solve_in_parity_block(comps, Q_p, k=0, tol=tol)
+            eigval = float(energies_p[0])
+            amplitudes = eigvecs_p[:, 0].reshape(D_up, D_down)
+            selected_parity = predicted
+        else:
+            Q_pos = _build_parity_projection(reps_pos, partner, self_mask, s_ref, +1, D)
+            Q_neg = _build_parity_projection(reps_neg, partner, self_mask, s_ref, -1, D)
+            energies_pos, eigvecs_pos = _solve_in_parity_block(comps, Q_pos, k=k, tol=tol)
+            energies_neg, eigvecs_neg = _solve_in_parity_block(comps, Q_neg, k=k, tol=tol)
+            all_energies = np.concatenate([energies_pos, energies_neg])
+            all_eigvecs = np.concatenate([eigvecs_pos, eigvecs_neg], axis=1)
+            parities = np.concatenate(
+                [np.full(len(energies_pos), +1), np.full(len(energies_neg), -1)]
             )
+            order = np.argsort(all_energies)
+            eigval = float(all_energies[order[k]])
+            amplitudes = all_eigvecs[:, order[k]].reshape(D_up, D_down)
+            selected_parity = int(parities[order[k]])
+
+            if verify_parity and k == 0:
+                predicted = _predict_ground_parity(s)
+                assert selected_parity == predicted, (
+                    f"ground-state parity mismatch: solver returned "
+                    f"{selected_parity}, prediction "
+                    f"(eps_Nup * eps_Ndown) is {predicted}"
+                )
     else:
         # Full-basis fallback for asymmetric systems or use_parity=False.
         n_eig = k + 1
