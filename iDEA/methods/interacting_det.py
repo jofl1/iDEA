@@ -170,25 +170,35 @@ def _build_indicator(combs, n_grid):
     return sps.csr_matrix((data, (rows, cols)), shape=(D, n_grid))
 
 
-def solve(
-    s: iDEA.system.System,
-    k: int = 0,
-    tol: float = 0.0,
-) -> iDEA.state.ManyBodyState:
-    """Solve the interacting Schrödinger equation in determinant basis.
+class _SolverComponents:
+    """Precomputed structures shared between solve() and validation tests.
 
-    | Args:
-    |     s: iDEA.system.System, System object.
-    |     k: int, Energy level to return (0 = ground state).
-    |     tol: float, eigsh tolerance (0 = machine precision).
-
-    | Returns:
-    |     state: iDEA.state.ManyBodyState with .energy, .det_amplitudes,
-    |     .det_up_combs, .det_down_combs, .det_up_indicator, .det_down_indicator.
-    |     .full / .space / .spin are intentionally left as ArrayPlaceholder
-    |     in Phase B; use iDEA.methods.interacting_det.density() for the
-    |     density observable.
+    Holds the per-spin determinant basis, the hop matrices, the diagonal,
+    the assembled LinearOperator, and the indicator matrices used by the
+    density helper. Tests reach for the LinearOperator via
+    ``_build_solver_components(s).op`` to run Hermiticity and residual
+    checks without re-implementing matvec.
     """
+
+    __slots__ = (
+        "op",
+        "matvec",
+        "D",
+        "D_up",
+        "D_down",
+        "up_combs",
+        "down_combs",
+        "up_rank",
+        "down_rank",
+        "up_indicator",
+        "down_indicator",
+        "diag",
+        "up_hops",
+        "down_hops",
+    )
+
+
+def _build_solver_components(s: iDEA.system.System) -> _SolverComponents:
     n_grid = s.x.shape[0]
     n_up = s.up_count
     n_down = s.down_count
@@ -208,7 +218,6 @@ def solve(
 
     up_has_hops = up_hops.nnz > 0
     down_has_hops = down_hops.nnz > 0
-    down_hops_T = down_hops.T.tocsr() if down_has_hops else None
 
     def matvec(psi_flat):
         psi = psi_flat.reshape(D_up, D_down)
@@ -221,6 +230,48 @@ def solve(
 
     op = spsla.LinearOperator(shape=(D, D), matvec=matvec, dtype=float)
 
+    comps = _SolverComponents()
+    comps.op = op
+    comps.matvec = matvec
+    comps.D = D
+    comps.D_up = D_up
+    comps.D_down = D_down
+    comps.up_combs = up_combs
+    comps.down_combs = down_combs
+    comps.up_rank = up_rank
+    comps.down_rank = down_rank
+    comps.up_indicator = _build_indicator(up_combs, n_grid)
+    comps.down_indicator = _build_indicator(down_combs, n_grid)
+    comps.diag = diag
+    comps.up_hops = up_hops
+    comps.down_hops = down_hops
+    return comps
+
+
+def solve(
+    s: iDEA.system.System,
+    k: int = 0,
+    tol: float = 0.0,
+) -> iDEA.state.ManyBodyState:
+    """Solve the interacting Schrödinger equation in determinant basis.
+
+    | Args:
+    |     s: iDEA.system.System, System object.
+    |     k: int, Energy level to return (0 = ground state).
+    |     tol: float, eigsh tolerance (0 = machine precision).
+
+    | Returns:
+    |     state: iDEA.state.ManyBodyState with .energy, .det_amplitudes,
+    |     .det_up_combs, .det_down_combs, .det_up_indicator, .det_down_indicator.
+    |     .full / .space / .spin are intentionally left as ArrayPlaceholder
+    |     in Phase B; use iDEA.methods.interacting_det.density() for the
+    |     density observable.
+    """
+    comps = _build_solver_components(s)
+    D = comps.D
+    D_up = comps.D_up
+    D_down = comps.D_down
+
     n_eig = k + 1
     if n_eig >= D - 1:
         # eigsh requires k < D - 1; for tiny problems just densify.
@@ -228,12 +279,12 @@ def solve(
         for col in range(D):
             e = np.zeros(D)
             e[col] = 1.0
-            dense[:, col] = matvec(e)
+            dense[:, col] = comps.matvec(e)
         energies, eigvecs = np.linalg.eigh(dense)
         eigvecs = eigvecs[:, : k + 1]
         energies = energies[: k + 1]
     else:
-        energies, eigvecs = spsla.eigsh(op, k=n_eig, which="SA", tol=tol)
+        energies, eigvecs = spsla.eigsh(comps.op, k=n_eig, which="SA", tol=tol)
         order = np.argsort(energies)
         energies = energies[order]
         eigvecs = eigvecs[:, order]
@@ -243,10 +294,10 @@ def solve(
 
     state = iDEA.state.ManyBodyState(energy=eigval)
     state.det_amplitudes = amplitudes
-    state.det_up_combs = up_combs
-    state.det_down_combs = down_combs
-    state.det_up_indicator = _build_indicator(up_combs, n_grid)
-    state.det_down_indicator = _build_indicator(down_combs, n_grid)
+    state.det_up_combs = comps.up_combs
+    state.det_down_combs = comps.down_combs
+    state.det_up_indicator = comps.up_indicator
+    state.det_down_indicator = comps.down_indicator
     return state
 
 

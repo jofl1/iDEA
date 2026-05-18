@@ -78,14 +78,20 @@ Summary
 Energy and density match between solvers to within 1e-13 across all cases
 (checked via tests/test_interacting_det.py with rtol=1e-10).
 
-The uu_80 case has no theoretical dimension cut (labelled and determinant
-basis are the same size for 2-electron systems), so its 1.36x gain is
-entirely from skipping antisymmetrize() and from solving for k=1 eigenpair
-instead of _estimate_level()=4.
+The uu_80 case sees a 2x dimension cut from same-spin Pauli (labelled
+80^2=6400 -> determinant C(80,2)*C(80,0)=3160 since `electrons="uu"`
+means 2 up + 0 down, not 1 up + 1 down). Combined with skipping
+antisymmetrize() and avoiding the labelled _estimate_level=18
+overcompute ((|2-0|+1)^2 * 2 * 1 = 18 eigenpairs vs 1 in determinant),
+the modest 1.36x gain is what we'd expect at this tiny problem size
+where Python/ARPACK setup dominates.
 
-The uud_60 case sees a 16x dimension cut (1.7M -> 106K determinant basis)
-which compounds with the antisymmetrize savings to give 25x wall time and
-~8x memory reduction.
+The uud_60 case has a ~2x raw dimension cut (labelled 60^3=216,000 ->
+determinant C(60,2)*C(60,1)=106,200). The 25x wall-time speedup comes
+mostly from elsewhere: avoiding _estimate_level=12 overcompute,
+avoiding the labelled CSR Hamiltonian construction, and avoiding the
+post-solve antisymmetrize+filter+deduplicate pass. The ~8x memory
+reduction is dominated by skipping the global Kronecker CSR.
 
 The uudd_30 case is the qualitative win: the labelled solver can't reliably
 produce this case at all, and the determinant solver does it in under 2
