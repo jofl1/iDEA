@@ -1,3 +1,5 @@
+__pycache__/
 iDEA/__pycache__/
 iDEA/methods/__pycache__/
+benchmarks/golden_outputs/
 *.egg-info/
