@@ -4,6 +4,7 @@ import string
 from typing import Union
 
 import numpy as np
+import scipy.signal as spsig
 
 import iDEA.methods.interacting
 import iDEA.methods.non_interacting
@@ -164,12 +165,18 @@ def _density_single_body_optimized(
     state: iDEA.state.SingleBodyState,
     return_spins: bool = False,
 ) -> np.ndarray:
-    up_n = np.zeros(shape=s.x.shape[0])
-    down_n = np.zeros(shape=s.x.shape[0])
-    for i in np.nonzero(state.up.occupations)[0]:
-        up_n += abs(state.up.orbitals[:, i]) ** 2 * state.up.occupations[i]
-    for i in np.nonzero(state.down.occupations)[0]:
-        down_n += abs(state.down.orbitals[:, i]) ** 2 * state.down.occupations[i]
+    up_nz = np.nonzero(state.up.occupations)[0]
+    down_nz = np.nonzero(state.down.occupations)[0]
+    if up_nz.size:
+        up_orbitals = state.up.orbitals[:, up_nz]
+        up_n = (up_orbitals * up_orbitals) @ state.up.occupations[up_nz]
+    else:
+        up_n = np.zeros(shape=s.x.shape[0])
+    if down_nz.size:
+        down_orbitals = state.down.orbitals[:, down_nz]
+        down_n = (down_orbitals * down_orbitals) @ state.down.occupations[down_nz]
+    else:
+        down_n = np.zeros(shape=s.x.shape[0])
     n = up_n + down_n
     if return_spins:
         return n, up_n, down_n
@@ -505,6 +512,39 @@ def external_energy(s: iDEA.system.System, n: np.ndarray, v_ext: np.ndarray) -> 
         raise AttributeError(f"Expected array of shape 1 or 2, got {n.shape} instead.")
 
 
+_HARTREE_FFT_MIN_N = 384
+
+
+def _v_int_is_static_kernel(v_int: np.ndarray) -> bool:
+    # Quick check: v_int is (approximately) symmetric Toeplitz and large
+    # enough for FFT convolution to outpace direct matvec. Below the
+    # threshold, BLAS dgemv is cache-resident and wins.
+    if v_int.ndim != 2:
+        return False
+    n = v_int.shape[0]
+    if n < _HARTREE_FFT_MIN_N or v_int.shape[1] != n:
+        return False
+    if not np.issubdtype(v_int.dtype, np.floating):
+        return False
+    tol = 1e-10
+    for k in (1, 2, 3):
+        if not np.isclose(v_int[0, k], v_int[k, 0], atol=tol, rtol=tol):
+            return False
+        if not np.isclose(v_int[0, 0], v_int[k, k], atol=tol, rtol=tol):
+            return False
+        if not np.isclose(v_int[0, 1], v_int[k, k + 1], atol=tol, rtol=tol):
+            return False
+    return True
+
+
+def _hartree_potential_fft(s: iDEA.system.System, n: np.ndarray) -> np.ndarray:
+    # FFT convolution form of v_h[i] = dx * sum_j v_int[i, j] * n[j]
+    # for symmetric Toeplitz v_int, with v_int[i, j] = u(|i - j| * dx).
+    kernel_half = s.v_int[:, 0]
+    kernel_full = np.concatenate([kernel_half[::-1], kernel_half[1:]])
+    return spsig.fftconvolve(n, kernel_full, mode="valid") * s.dx
+
+
 def hartree_potential(s: iDEA.system.System, n: np.ndarray) -> np.ndarray:
     r"""
     Compute the Hartree potential from a density.
@@ -517,10 +557,16 @@ def hartree_potential(s: iDEA.system.System, n: np.ndarray) -> np.ndarray:
     |     v_h: np.ndarray, Hartree potential, or evolution of Hartree potential.
     """
     if len(n.shape) == 1:
-        v_h = np.dot(n, s.v_int) * s.dx
-        return v_h
+        if _v_int_is_static_kernel(s.v_int):
+            return _hartree_potential_fft(s, n)
+        return np.dot(n, s.v_int) * s.dx
 
     elif len(n.shape) == 2:
+        if _v_int_is_static_kernel(s.v_int):
+            v_h = np.zeros_like(n)
+            for j in range(v_h.shape[0]):
+                v_h[j, :] = _hartree_potential_fft(s, n[j, :])
+            return v_h
         v_h = np.zeros_like(n)
         for j in range(v_h.shape[0]):
             v_h[j, :] = np.dot(n[j, :], s.v_int[:, :]) * s.dx
