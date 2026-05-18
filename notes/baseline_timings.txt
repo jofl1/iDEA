@@ -1,0 +1,42 @@
+iDEA interacting solver — Phase A baseline measurements
+
+Captured before the determinant-basis matrix-free LinearOperator work
+(notes/friend_optimization_advice.md). These numbers are the reference
+point for Phase B speedup claims.
+
+Hardware: user's Mac (Darwin 24.6.0).
+Solver: current iDEA.methods.interacting.solve (CSR labelled tensor basis +
+  scipy.sparse.linalg.eigsh + post-solve antisymmetrize).
+
+Cases:
+  interacting_uu_80   — 1↑1↓ harmonic, N=80, electrons=2
+  interacting_uud_60  — 2↑1↓ harmonic, N=60, electrons=3
+
+  The 4-electron case (uudd) is deferred to Phase B. At all 4-electron
+  sizes the current solver's antisymmetrize() pass stochastically fails
+  with IndexError when all Lanczos eigenvectors antisymmetrize to zero
+  (a manifestation of the wrong-basis problem in the friend's review).
+  The determinant-basis switch eliminates the failure mode entirely.
+
+Re-measure with:
+  python benchmarks/benchmark_interacting.py time --runs 3
+
+Generate baselines for cross-machine sanity checks with:
+  python benchmarks/benchmark_interacting.py generate
+
+Validate current solver against committed baselines with:
+  python benchmarks/benchmark_interacting.py compare
+
+----- raw output of `python benchmarks/benchmark_interacting.py time --runs 3` -----
+
+interacting_uu_80
+  wall time median: 0.166s (3 runs, min=0.158s max=0.176s)
+  peak memory:      129.0 MB (process cumulative)
+  energy:           0.7531826851
+  density integral: 2.000000 (should equal electron count = 2)
+
+interacting_uud_60
+  wall time median: 26.146s (3 runs, min=25.146s max=29.790s)
+  peak memory:      1250.0 MB (process cumulative)
+  energy:           1.6251528746
+  density integral: 3.000000 (should equal electron count = 3)
