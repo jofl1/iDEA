@@ -97,6 +97,139 @@ def observable(
         raise AttributeError("State or Evolution must be provided.")
 
 
+def _zero_occupation_orbitals_are_safe_to_skip(
+    orbitals: np.ndarray, occupations: np.ndarray
+) -> bool:
+    zero_occupation_indices = np.nonzero(occupations == 0)[0]
+    if zero_occupation_indices.shape[0] == 0:
+        return True
+
+    zero_occupation_orbitals = orbitals[:, zero_occupation_indices]
+    if not np.all(np.isfinite(zero_occupation_orbitals)):
+        return False
+
+    if np.issubdtype(zero_occupation_orbitals.dtype, np.floating):
+        max_abs = np.max(abs(zero_occupation_orbitals))
+        max_safe_abs = np.sqrt(np.finfo(zero_occupation_orbitals.dtype).max)
+        if max_abs > max_safe_abs:
+            return False
+
+    return True
+
+
+def _single_body_state_allows_zero_occupation_skip(
+    state: iDEA.state.SingleBodyState,
+) -> bool:
+    if np.iscomplexobj(state.up.orbitals) or np.iscomplexobj(state.down.orbitals):
+        return False
+    if np.iscomplexobj(state.up.occupations) or np.iscomplexobj(
+        state.down.occupations
+    ):
+        return False
+    if not np.issubdtype(state.up.orbitals.dtype, np.floating) or not np.issubdtype(
+        state.down.orbitals.dtype, np.floating
+    ):
+        return False
+
+    return _zero_occupation_orbitals_are_safe_to_skip(
+        state.up.orbitals, state.up.occupations
+    ) and _zero_occupation_orbitals_are_safe_to_skip(
+        state.down.orbitals, state.down.occupations
+    )
+
+
+def _density_single_body_reference(
+    s: iDEA.system.System,
+    state: iDEA.state.SingleBodyState,
+    return_spins: bool = False,
+) -> np.ndarray:
+    up_n = np.zeros(shape=s.x.shape[0])
+    down_n = np.zeros(shape=s.x.shape[0])
+    for i in range(state.up.orbitals.shape[1]):
+        up_n += abs(state.up.orbitals[:, i]) ** 2 * state.up.occupations[i]
+    for i in range(state.down.orbitals.shape[1]):
+        down_n += abs(state.down.orbitals[:, i]) ** 2 * state.down.occupations[i]
+    n = up_n + down_n
+    if return_spins:
+        return n, up_n, down_n
+    else:
+        return n
+
+
+def _density_single_body_optimized(
+    s: iDEA.system.System,
+    state: iDEA.state.SingleBodyState,
+    return_spins: bool = False,
+) -> np.ndarray:
+    up_n = np.zeros(shape=s.x.shape[0])
+    down_n = np.zeros(shape=s.x.shape[0])
+    for i in np.nonzero(state.up.occupations)[0]:
+        up_n += abs(state.up.orbitals[:, i]) ** 2 * state.up.occupations[i]
+    for i in np.nonzero(state.down.occupations)[0]:
+        down_n += abs(state.down.orbitals[:, i]) ** 2 * state.down.occupations[i]
+    n = up_n + down_n
+    if return_spins:
+        return n, up_n, down_n
+    else:
+        return n
+
+
+def _density_matrix_single_body_reference(
+    s: iDEA.system.System,
+    state: iDEA.state.SingleBodyState,
+    return_spins: bool = False,
+) -> np.ndarray:
+    up_p = np.zeros(shape=s.x.shape * 2)
+    down_p = np.zeros(shape=s.x.shape * 2)
+    for i in range(state.up.orbitals.shape[1]):
+        up_p += (
+            np.tensordot(
+                state.up.orbitals[:, i], state.up.orbitals[:, i].conj(), axes=0
+            )
+            * state.up.occupations[i]
+        )
+    for i in range(state.down.orbitals.shape[1]):
+        down_p += (
+            np.tensordot(
+                state.down.orbitals[:, i], state.down.orbitals[:, i].conj(), axes=0
+            )
+            * state.down.occupations[i]
+        )
+    p = up_p + down_p
+    if return_spins:
+        return p, up_p, down_p
+    else:
+        return p
+
+
+def _density_matrix_single_body_optimized(
+    s: iDEA.system.System,
+    state: iDEA.state.SingleBodyState,
+    return_spins: bool = False,
+) -> np.ndarray:
+    up_p = np.zeros(shape=s.x.shape * 2)
+    down_p = np.zeros(shape=s.x.shape * 2)
+    for i in np.nonzero(state.up.occupations)[0]:
+        up_p += (
+            np.tensordot(
+                state.up.orbitals[:, i], state.up.orbitals[:, i].conj(), axes=0
+            )
+            * state.up.occupations[i]
+        )
+    for i in np.nonzero(state.down.occupations)[0]:
+        down_p += (
+            np.tensordot(
+                state.down.orbitals[:, i], state.down.orbitals[:, i].conj(), axes=0
+            )
+            * state.down.occupations[i]
+        )
+    p = up_p + down_p
+    if return_spins:
+        return p, up_p, down_p
+    else:
+        return p
+
+
 def density(
     s: iDEA.system.System,
     state: Union[iDEA.state.SingleBodyState, iDEA.state.ManyBodyState] = None,
@@ -130,18 +263,10 @@ def density(
         else:
             return n
 
-    if state is not None and isinstance(state, iDEA.state.SingleBodyState):
-        up_n = np.zeros(shape=s.x.shape[0])
-        down_n = np.zeros(shape=s.x.shape[0])
-        for i in range(state.up.orbitals.shape[1]):
-            up_n += abs(state.up.orbitals[:, i]) ** 2 * state.up.occupations[i]
-        for i in range(state.down.orbitals.shape[1]):
-            down_n += abs(state.down.orbitals[:, i]) ** 2 * state.down.occupations[i]
-        n = up_n + down_n
-        if return_spins:
-            return n, up_n, down_n
-        else:
-            return n
+    if state is not None and type(state) == iDEA.state.SingleBodyState:
+        if _single_body_state_allows_zero_occupation_skip(state):
+            return _density_single_body_optimized(s, state, return_spins)
+        return _density_single_body_reference(s, state, return_spins)
 
     if evolution is not None and isinstance(evolution, iDEA.state.ManyBodyEvolution):
         if time_indices is None:
@@ -229,23 +354,10 @@ def density_matrix(
         else:
             return p
 
-    if state is not None and isinstance(state, iDEA.state.SingleBodyState):
-        up_p = np.zeros(shape=s.x.shape * 2)
-        down_p = np.zeros(shape=s.x.shape * 2)
-        for i in range(state.up.orbitals.shape[1]):
-            up_p += (
-                np.tensordot(state.up.orbitals[:, i], state.up.orbitals[:, i].conj(), axes=0) * state.up.occupations[i]
-            )
-        for i in range(state.down.orbitals.shape[1]):
-            down_p += (
-                np.tensordot(state.down.orbitals[:, i], state.down.orbitals[:, i].conj(), axes=0)
-                * state.down.occupations[i]
-            )
-        p = up_p + down_p
-        if return_spins:
-            return p, up_p, down_p
-        else:
-            return p
+    if state is not None and type(state) == iDEA.state.SingleBodyState:
+        if _single_body_state_allows_zero_occupation_skip(state):
+            return _density_matrix_single_body_optimized(s, state, return_spins)
+        return _density_matrix_single_body_reference(s, state, return_spins)
 
     if evolution is not None and isinstance(evolution, iDEA.state.ManyBodyEvolution):
         if time_indices is None:
