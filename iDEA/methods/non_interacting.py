@@ -216,6 +216,7 @@ def sc_step(
     state: iDEA.state.SingleBodyState,
     up_H: np.ndarray,
     down_H: np.ndarray,
+    k: int = 0,
 ):
     r"""
     Performs a single step of the self-consistent cycle.
@@ -225,13 +226,21 @@ def sc_step(
     |     state: iDEA.state.SingleBodyState, Previous state.
     |     up_H: np.ndarray, Hamiltonian for up electrons.
     |     down_H: np.ndarray, Hamiltonian for down electrons.
+    |     k: int, Excitation level needed downstream (default = 0, ground state).
 
     | Returns:
     |     state: iDEA.state.SingleBodyState, New state.
     """
-    # Solve the non-interacting Schrodinger equation.
-    state.up.energies, state.up.orbitals = spla.eigh(up_H)
-    state.down.energies, state.down.orbitals = spla.eigh(down_H)
+    # Solve the non-interacting Schrodinger equation. Compute only the lowest
+    # max(up_count, down_count) + k eigenpairs needed by add_occupations and
+    # the density observables; fall back to full eigh for degenerate edge cases.
+    max_level = max(s.up_count, s.down_count) + k
+    if 1 <= max_level < up_H.shape[0]:
+        state.up.energies, state.up.orbitals = spla.eigh(up_H, subset_by_index=(0, max_level - 1))
+        state.down.energies, state.down.orbitals = spla.eigh(down_H, subset_by_index=(0, max_level - 1))
+    else:
+        state.up.energies, state.up.orbitals = spla.eigh(up_H)
+        state.down.energies, state.down.orbitals = spla.eigh(down_H)
 
     # Normalise orbitals.
     state.up.orbitals = state.up.orbitals / np.sqrt(s.dx)
@@ -312,7 +321,7 @@ def solve(
     count = 0
     while convergence > tol:
         # Perform single self-consistent step.
-        state = sc_step(s, state, up_H, down_H)
+        state = sc_step(s, state, up_H, down_H, k=k)
 
         # Update values.
         n, up_n, down_n = iDEA.observables.density(s, state, return_spins=True)

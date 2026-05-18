@@ -100,7 +100,10 @@ def observable(
 def _zero_occupation_orbitals_are_safe_to_skip(
     orbitals: np.ndarray, occupations: np.ndarray
 ) -> bool:
-    zero_occupation_indices = np.nonzero(occupations == 0)[0]
+    # Only consider zero-occupation indices that correspond to computed orbitals;
+    # solver subset modes may leave occupations longer than the orbital basis.
+    n_orbitals = orbitals.shape[1]
+    zero_occupation_indices = np.nonzero(occupations[:n_orbitals] == 0)[0]
     if zero_occupation_indices.shape[0] == 0:
         return True
 
