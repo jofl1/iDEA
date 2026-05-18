@@ -30,10 +30,12 @@ import numpy as np
 
 import iDEA
 import iDEA.methods.interacting
+import iDEA.methods.interacting_det
 import iDEA.observables
 
 
 DEFAULT_BASELINE_DIR = Path("benchmarks/interacting_baseline")
+SOLVERS = ("labelled", "det")
 
 
 def interacting_uu_80():
@@ -53,20 +55,23 @@ def interacting_uud_60():
     return iDEA.system.System(x, v_ext, v_int, electrons="uud")
 
 
+def interacting_uudd_30():
+    # 4-electron stress at small grid. Labelled-basis dimension (2N)^4 = 12.96M
+    # is reduced to C(30,2)^2 = 189,225 in the determinant basis (~70x cut).
+    # The labelled iDEA.methods.interacting.solve stochastically fails on this
+    # case (antisymmetrize() empties the eigenvector pool); only the determinant
+    # solver iDEA.methods.interacting_det.solve produces it reliably.
+    x = np.linspace(-8, 8, 30)
+    v_ext = 0.5 * 0.25**2 * x**2
+    v_int = iDEA.interactions.softened_interaction(x)
+    return iDEA.system.System(x, v_ext, v_int, electrons="uudd")
+
+
 CASES = {
     "interacting_uu_80": interacting_uu_80,
     "interacting_uud_60": interacting_uud_60,
+    "interacting_uudd_30": interacting_uudd_30,
 }
-
-# 4-electron case (uudd_30) deliberately deferred to Phase B. The current
-# interacting solver works in the labelled tensor basis and calls
-# antisymmetrize() after the eigsh solve; for uudd at the default
-# _estimate_level=4 the Lanczos-returned eigenvectors stochastically all
-# antisymmetrize to zero, producing an IndexError. This is the exact failure
-# mode the friend identified (notes/friend_optimization_advice.md): solving
-# in the wrong basis. Once the determinant-basis matrix-free LinearOperator
-# replaces antisymmetrize-after-solve, the 4-electron case will be added
-# back at uudd_30 (and likely uudd_60).
 
 
 def peak_memory_mb():
@@ -77,15 +82,27 @@ def peak_memory_mb():
     return rss / 1024
 
 
-def solve_and_measure(s):
-    # interacting.solve prints "solving eigenproblem on CPU..." unconditionally;
-    # suppress it so benchmark output stays clean.
-    start = time.perf_counter()
-    with contextlib.redirect_stdout(io.StringIO()):
-        state = iDEA.methods.interacting.solve(s, k=0)
-    elapsed = time.perf_counter() - start
-    density = iDEA.observables.density(s, state=state)
-    return elapsed, float(state.energy), density
+def solve_and_measure(s, solver="labelled"):
+    """Run the chosen solver and return (elapsed, energy, density).
+
+    The labelled solver prints to stdout unconditionally; redirect to keep
+    benchmark output clean. The determinant solver returns a state whose
+    density must be computed via the determinant-aware helper.
+    """
+    if solver == "labelled":
+        start = time.perf_counter()
+        with contextlib.redirect_stdout(io.StringIO()):
+            state = iDEA.methods.interacting.solve(s, k=0)
+        elapsed = time.perf_counter() - start
+        density = iDEA.observables.density(s, state=state)
+        return elapsed, float(state.energy), density
+    if solver == "det":
+        start = time.perf_counter()
+        state = iDEA.methods.interacting_det.solve(s, k=0)
+        elapsed = time.perf_counter() - start
+        density = iDEA.methods.interacting_det.density(s, state)
+        return elapsed, float(state.energy), density
+    raise ValueError(f"Unknown solver: {solver!r}; choose from {SOLVERS}")
 
 
 def build_baseline_payload(s, energy, density):
@@ -99,15 +116,15 @@ def build_baseline_payload(s, energy, density):
     }
 
 
-def time_cases(case_names, runs):
+def time_cases(case_names, runs, solver="labelled"):
     for name in case_names:
-        print(f"\n{name}")
+        print(f"\n{name} (solver={solver})")
         s = CASES[name]()
         times = []
         last_energy = None
         last_density = None
         for _ in range(runs):
-            elapsed, energy, density = solve_and_measure(s)
+            elapsed, energy, density = solve_and_measure(s, solver=solver)
             times.append(elapsed)
             last_energy = energy
             last_density = density
@@ -124,13 +141,13 @@ def time_cases(case_names, runs):
         )
 
 
-def generate_baselines(case_names, baseline_dir):
+def generate_baselines(case_names, baseline_dir, solver="labelled"):
     baseline_dir = Path(baseline_dir)
     baseline_dir.mkdir(parents=True, exist_ok=True)
     for name in case_names:
-        print(f"\ngenerating {name}")
+        print(f"\ngenerating {name} (solver={solver})")
         s = CASES[name]()
-        elapsed, energy, density = solve_and_measure(s)
+        elapsed, energy, density = solve_and_measure(s, solver=solver)
         payload = build_baseline_payload(s, energy, density)
         path = baseline_dir / f"{name}.npz"
         np.savez_compressed(path, **payload)
@@ -143,7 +160,7 @@ def generate_baselines(case_names, baseline_dir):
         )
 
 
-def compare_baselines(case_names, baseline_dir, rtol=1e-10, atol=1e-12):
+def compare_baselines(case_names, baseline_dir, rtol=1e-10, atol=1e-12, solver="labelled"):
     baseline_dir = Path(baseline_dir)
     any_fail = False
     for name in case_names:
@@ -153,17 +170,17 @@ def compare_baselines(case_names, baseline_dir, rtol=1e-10, atol=1e-12):
             any_fail = True
             continue
         s = CASES[name]()
-        elapsed, energy, density = solve_and_measure(s)
+        elapsed, energy, density = solve_and_measure(s, solver=solver)
         with np.load(path, allow_pickle=False) as baseline:
             ref_energy = float(baseline["energy"])
             ref_density = baseline["density"]
         energy_ok = np.isclose(energy, ref_energy, rtol=rtol, atol=atol)
         density_ok = np.allclose(density, ref_density, rtol=rtol, atol=atol)
         if energy_ok and density_ok:
-            print(f"PASS {name} ({elapsed:.3f}s)")
+            print(f"PASS {name} (solver={solver}, {elapsed:.3f}s)")
         else:
             any_fail = True
-            print(f"FAIL {name}")
+            print(f"FAIL {name} (solver={solver})")
             if not energy_ok:
                 print(
                     f"  energy: current={energy:.16e} baseline={ref_energy:.16e} "
@@ -182,16 +199,19 @@ def main(argv=None):
     time_parser = subparsers.add_parser("time")
     time_parser.add_argument("--runs", type=int, default=3)
     time_parser.add_argument("--case", choices=sorted(CASES), action="append")
+    time_parser.add_argument("--solver", choices=SOLVERS, default="labelled")
 
     gen_parser = subparsers.add_parser("generate")
     gen_parser.add_argument("--baseline-dir", default=str(DEFAULT_BASELINE_DIR))
     gen_parser.add_argument("--case", choices=sorted(CASES), action="append")
+    gen_parser.add_argument("--solver", choices=SOLVERS, default="labelled")
 
     cmp_parser = subparsers.add_parser("compare")
     cmp_parser.add_argument("--baseline-dir", default=str(DEFAULT_BASELINE_DIR))
     cmp_parser.add_argument("--case", choices=sorted(CASES), action="append")
     cmp_parser.add_argument("--rtol", type=float, default=1e-10)
     cmp_parser.add_argument("--atol", type=float, default=1e-12)
+    cmp_parser.add_argument("--solver", choices=SOLVERS, default="labelled")
 
     args = parser.parse_args(argv)
 
@@ -202,14 +222,18 @@ def main(argv=None):
     case_names = args.case or sorted(CASES)
 
     if args.command == "time":
-        time_cases(case_names, runs=args.runs)
+        time_cases(case_names, runs=args.runs, solver=args.solver)
         return 0
     if args.command == "generate":
-        generate_baselines(case_names, args.baseline_dir)
+        generate_baselines(case_names, args.baseline_dir, solver=args.solver)
         return 0
     if args.command == "compare":
         any_fail = compare_baselines(
-            case_names, args.baseline_dir, rtol=args.rtol, atol=args.atol
+            case_names,
+            args.baseline_dir,
+            rtol=args.rtol,
+            atol=args.atol,
+            solver=args.solver,
         )
         return 1 if any_fail else 0
 

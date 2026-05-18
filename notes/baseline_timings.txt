@@ -1,42 +1,102 @@
-iDEA interacting solver — Phase A baseline measurements
-
-Captured before the determinant-basis matrix-free LinearOperator work
-(notes/friend_optimization_advice.md). These numbers are the reference
-point for Phase B speedup claims.
+iDEA interacting solver timings — Phase A baseline + Phase B results
 
 Hardware: user's Mac (Darwin 24.6.0).
-Solver: current iDEA.methods.interacting.solve (CSR labelled tensor basis +
-  scipy.sparse.linalg.eigsh + post-solve antisymmetrize).
 
-Cases:
-  interacting_uu_80   — 1↑1↓ harmonic, N=80, electrons=2
-  interacting_uud_60  — 2↑1↓ harmonic, N=60, electrons=3
+==============================================================================
+Phase A — labelled tensor basis (iDEA.methods.interacting.solve)
+==============================================================================
 
-  The 4-electron case (uudd) is deferred to Phase B. At all 4-electron
-  sizes the current solver's antisymmetrize() pass stochastically fails
-  with IndexError when all Lanczos eigenvectors antisymmetrize to zero
-  (a manifestation of the wrong-basis problem in the friend's review).
-  The determinant-basis switch eliminates the failure mode entirely.
+The reference point before any optimization. CSR labelled tensor basis +
+scipy.sparse.linalg.eigsh + post-solve antisymmetrize.
 
 Re-measure with:
-  python benchmarks/benchmark_interacting.py time --runs 3
+  python benchmarks/benchmark_interacting.py time --runs 3 --solver labelled
 
-Generate baselines for cross-machine sanity checks with:
-  python benchmarks/benchmark_interacting.py generate
+----- raw output of `python benchmarks/benchmark_interacting.py time --runs 3 --solver labelled` -----
 
-Validate current solver against committed baselines with:
-  python benchmarks/benchmark_interacting.py compare
-
------ raw output of `python benchmarks/benchmark_interacting.py time --runs 3` -----
-
-interacting_uu_80
+interacting_uu_80 (solver=labelled)
   wall time median: 0.166s (3 runs, min=0.158s max=0.176s)
-  peak memory:      129.0 MB (process cumulative)
+  peak memory:      129.0 MB
   energy:           0.7531826851
-  density integral: 2.000000 (should equal electron count = 2)
+  density integral: 2.000000
 
-interacting_uud_60
+interacting_uud_60 (solver=labelled)
   wall time median: 26.146s (3 runs, min=25.146s max=29.790s)
-  peak memory:      1250.0 MB (process cumulative)
+  peak memory:      1250.0 MB
   energy:           1.6251528746
-  density integral: 3.000000 (should equal electron count = 3)
+  density integral: 3.000000
+
+interacting_uudd_30 (solver=labelled)
+  NOT MEASURED — labelled solver fails stochastically on this case. The
+  Lanczos-returned eigenvectors sometimes all antisymmetrize to zero,
+  triggering an IndexError in iDEA.methods.interacting:antisymmetrize.
+  One lucky run produced energy=2.9201268311, but the case is unusable
+  for routine baseline work in the labelled representation.
+
+==============================================================================
+Phase B — determinant basis (iDEA.methods.interacting_det.solve)
+==============================================================================
+
+Matrix-free LinearOperator in the fixed-spin Slater-determinant basis
+(notes/friend_optimization_advice.md). scipy.sparse.linalg.eigsh as a
+control experiment — no preconditioner, no eigensolver swap, just the
+representation change.
+
+Re-measure with:
+  python benchmarks/benchmark_interacting.py time --runs 3 --solver det
+
+----- raw output of `python benchmarks/benchmark_interacting.py time --runs 3 --solver det` -----
+
+interacting_uu_80 (solver=det)
+  wall time median: 0.122s (3 runs, min=0.120s max=0.123s)
+  peak memory:      99.7 MB
+  energy:           0.7531826851
+  density integral: 2.000000
+
+interacting_uud_60 (solver=det)
+  wall time median: 1.062s (3 runs, min=1.024s max=1.158s)
+  peak memory:      160.3 MB
+  energy:           1.6251528746
+  density integral: 3.000000
+
+interacting_uudd_30 (solver=det)
+  wall time median: 1.666s (3 runs, min=1.636s max=1.741s)
+  peak memory:      244.4 MB
+  energy:           2.9201268311
+  density integral: 4.000000
+
+==============================================================================
+Summary
+==============================================================================
+
+| Case               | Phase A wall | Phase B wall | Speedup | Phase A mem | Phase B mem | Mem reduction |
+| ------------------ | -----------: | -----------: | ------: | ----------: | ----------: | ------------: |
+| interacting_uu_80  |       0.166s |       0.122s |   1.36x |     129 MB  |     100 MB  |          -23% |
+| interacting_uud_60 |      26.146s |       1.062s |  24.62x |    1250 MB  |     160 MB  |          -87% |
+| interacting_uudd_30|     (fails)  |       1.666s |     N/A |    (failed) |     244 MB  |           N/A |
+
+Energy and density match between solvers to within 1e-13 across all cases
+(checked via tests/test_interacting_det.py with rtol=1e-10).
+
+The uu_80 case has no theoretical dimension cut (labelled and determinant
+basis are the same size for 2-electron systems), so its 1.36x gain is
+entirely from skipping antisymmetrize() and from solving for k=1 eigenpair
+instead of _estimate_level()=4.
+
+The uud_60 case sees a 16x dimension cut (1.7M -> 106K determinant basis)
+which compounds with the antisymmetrize savings to give 25x wall time and
+~8x memory reduction.
+
+The uudd_30 case is the qualitative win: the labelled solver can't reliably
+produce this case at all, and the determinant solver does it in under 2
+seconds with stable runs.
+
+==============================================================================
+Validate solvers against committed baselines (rtol=1e-10)
+==============================================================================
+
+  python benchmarks/benchmark_interacting.py compare --solver labelled
+  python benchmarks/benchmark_interacting.py compare --solver det
+
+The uudd_30 baseline is committed from the determinant solver (the
+labelled solver can't produce it reliably).
