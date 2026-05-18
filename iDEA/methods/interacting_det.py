@@ -547,3 +547,90 @@ def density(s: iDEA.system.System, state: iDEA.state.ManyBodyState) -> np.ndarra
     n_up = (up_indicator.T @ abs2.sum(axis=1)) / s.dx
     n_down = (down_indicator.T @ abs2.sum(axis=0)) / s.dx
     return np.asarray(n_up + n_down).ravel()
+
+
+def build_labelled_state(
+    s: iDEA.system.System, det_state: iDEA.state.ManyBodyState
+) -> iDEA.state.ManyBodyState:
+    """Reconstruct .space, .spin, .full from determinant amplitudes.
+
+    Plants each amplitude at its canonical labelled position then reuses
+    ``iDEA.methods.interacting.antisymmetrize`` to fill in all permutations,
+    normalize, and dedupe. Returns a new ManyBodyState with all the
+    attributes the original labelled solver provides — so existing
+    ``iDEA.observables`` code that indexes ``state.full`` continues to work
+    transparently.
+
+    The per-channel determinant amplitudes from ``det_state`` are
+    preserved on the returned state as ``det_amplitudes``,
+    ``det_up_combs``, ``det_down_combs``, ``det_up_indicator``,
+    ``det_down_indicator``, and ``parity`` for callers who want the
+    cheaper determinant-form observables.
+
+    | Args:
+    |     s: iDEA.system.System, the system the det_state was solved on.
+    |     det_state: iDEA.state.ManyBodyState with .det_amplitudes etc.
+    |         populated by ``interacting_det.solve``.
+
+    | Returns:
+    |     state: iDEA.state.ManyBodyState with .energy, .space, .spin,
+    |     .full all populated, plus the original det attributes.
+    """
+    import string
+    import iDEA.methods.interacting as _labelled
+
+    n_grid = s.x.shape[0]
+    n_e = s.count
+    electrons = s.electrons
+
+    up_axes = [i for i, c in enumerate(electrons) if c == "u"]
+    down_axes = [i for i, c in enumerate(electrons) if c == "d"]
+
+    # Plant each det amplitude at the canonical labelled position. Each
+    # (I_up, I_down) maps to exactly one labelled position; antisymmetrize
+    # handles the permutations.
+    spaces_single = np.zeros((n_grid,) * n_e, dtype=det_state.det_amplitudes.dtype)
+    for u_idx, up_comb in enumerate(det_state.det_up_combs):
+        for d_idx, down_comb in enumerate(det_state.det_down_combs):
+            c = det_state.det_amplitudes[u_idx, d_idx]
+            if c == 0:
+                continue
+            coords = [0] * n_e
+            for axis, idx in zip(up_axes, up_comb):
+                coords[axis] = idx
+            for axis, idx in zip(down_axes, down_comb):
+                coords[axis] = idx
+            spaces_single[tuple(coords)] = c
+    spaces = spaces_single[..., np.newaxis]
+
+    # Spins tensor: same construction the existing labelled solver uses.
+    symbols = string.ascii_lowercase
+    spin_basis = [
+        np.array([1.0, 0.0]) if c == "u" else np.array([0.0, 1.0])
+        for c in electrons
+    ]
+    spin_letters = symbols[:n_e]
+    spin_subscripts = ",".join(spin_letters) + "->" + "".join(spin_letters)
+    spin = np.einsum(spin_subscripts, *spin_basis)
+    spins = np.zeros((2,) * n_e + (1,), dtype=float)
+    spins[..., 0] = spin
+
+    energies = np.array([det_state.energy])
+
+    fulls, spaces_out, spins_out, energies_out = _labelled.antisymmetrize(
+        s, spaces, spins, energies
+    )
+
+    state = iDEA.state.ManyBodyState(
+        space=spaces_out[..., 0],
+        spin=spins_out[..., 0],
+        full=fulls[..., 0],
+        energy=float(energies_out[0]),
+    )
+    state.det_amplitudes = det_state.det_amplitudes
+    state.det_up_combs = det_state.det_up_combs
+    state.det_down_combs = det_state.det_down_combs
+    state.det_up_indicator = det_state.det_up_indicator
+    state.det_down_indicator = det_state.det_down_indicator
+    state.parity = getattr(det_state, "parity", 0)
+    return state
