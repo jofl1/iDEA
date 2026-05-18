@@ -577,6 +577,7 @@ def build_labelled_state(
     |     .full all populated, plus the original det attributes.
     """
     import string
+    from math import factorial
     import iDEA.methods.interacting as _labelled
 
     n_grid = s.x.shape[0]
@@ -621,8 +622,26 @@ def build_labelled_state(
         s, spaces, spins, energies
     )
 
+    # antisymmetrize() normalises .full but does NOT renormalise or
+    # re-antisymmetrise spaces (it returns the input, filtered/cropped).
+    # Legacy convention is .space = sqrt(M) * .full[canonical spin slice]
+    # where M = N_e! / (N_up! * N_down!) is the number of distinct spin
+    # arrangements with these counts. For uu (M=1) the canonical slice
+    # IS .space; for ud (M=2) it is .space / sqrt(2); etc.
+    spin_index = {"u": 0, "d": 1}
+    canonical_indexer = []
+    for c in s.electrons:
+        canonical_indexer.append(slice(None))
+        canonical_indexer.append(spin_index[c])
+    canonical_indexer = tuple(canonical_indexer)
+
+    spin_mult = factorial(s.count) / (
+        factorial(s.up_count) * factorial(s.down_count)
+    )
+    space = np.sqrt(spin_mult) * fulls[canonical_indexer + (0,)]
+
     state = iDEA.state.ManyBodyState(
-        space=spaces_out[..., 0],
+        space=space,
         spin=spins_out[..., 0],
         full=fulls[..., 0],
         energy=float(energies_out[0]),
