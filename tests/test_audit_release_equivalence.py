@@ -247,3 +247,124 @@ def test_asymmetric_offset_worker_payload_takes_non_parity_path():
         float(fast["energy"]), float(compat["energy"]), rtol=1e-8, atol=0
     )
     assert np.allclose(fast["density"], compat["density"], atol=1e-8, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# Phase S3.3: SolveContext audit-mode coverage
+# ---------------------------------------------------------------------------
+
+
+def test_solve_context_mode_is_registered():
+    audit = _load_audit_module()
+    assert "current_fast_ctx" in audit.MODES
+    assert "current_fast_ctx" in audit._CURRENT_FAST_MODES
+
+
+def test_solve_context_env_is_default():
+    """current_fast_ctx must NOT set any IDEA_DET_* overrides.
+
+    SolveContext is exercised under the default dispatch (PRIMME if
+    available, scipy otherwise). The explicit-backend variants live in
+    the current_fast_scipy / current_fast_primme / current_no_primme
+    modes, not on ctx.
+    """
+    audit = _load_audit_module()
+    env = audit.audit_env("current_fast_ctx")
+    assert "IDEA_DET_EIGSH_BACKEND" not in env
+    assert "IDEA_DET_PRIMME_MIN_DIM" not in env
+    assert "IDEA_DET_DISABLE_PRIMME" not in env
+
+
+def test_solve_context_imports_repo_root():
+    audit = _load_audit_module()
+    paths = audit.import_paths_for_mode("current_fast_ctx")
+    assert paths[0] == str(audit.REPO_ROOT), (
+        f"current_fast_ctx must import the repo, not the release site; "
+        f"got {paths[0]!r}"
+    )
+
+
+def test_disorder_sweep_case_is_registered():
+    audit = _load_audit_module()
+    assert "interacting_disorder_sweep_uu" in audit.solver_cases()
+
+
+def test_disorder_sweep_modes_include_ctx():
+    """The disorder sweep case must run under all seven modes — six
+    baseline modes for the per-call solves plus current_fast_ctx for
+    the warm-started sweep — so the audit cross-checks ctx against
+    every baseline.
+    """
+    audit = _load_audit_module()
+    modes = audit.modes_for_solver_case("interacting_disorder_sweep_uu")
+    assert "current_fast_ctx" in modes
+    for baseline in (
+        "release",
+        "current_compat",
+        "current_fast",
+        "current_fast_scipy",
+        "current_fast_primme",
+        "current_no_primme",
+    ):
+        assert baseline in modes, f"missing baseline mode {baseline!r}"
+
+
+def test_other_interacting_cases_omit_ctx_mode():
+    """current_fast_ctx must NOT leak onto other interacting cases.
+
+    SolveContext is only meaningful for a real sweep; the
+    single-solve interacting cases stay on the original six modes so
+    the audit report doesn't fill up with degenerate single-call ctx
+    runs.
+    """
+    audit = _load_audit_module()
+    for case in (
+        "interacting_harmonic_uu",
+        "interacting_harmonic_du",
+        "interacting_harmonic_uu_stencil5",
+        "interacting_offset_asymmetric_uu",
+        "interacting_propagate_harmonic_uu_kick",
+        "interacting_det_harmonic_uud",
+    ):
+        modes = audit.modes_for_solver_case(case)
+        assert "current_fast_ctx" not in modes, (
+            f"case {case!r} unexpectedly includes current_fast_ctx; "
+            f"only the disorder sweep should drive ctx mode"
+        )
+
+
+def test_disorder_sweep_payload_agrees_with_current_fast():
+    """SolveContext sweep must produce the same energies + densities
+    per element as per-call fast-path solves.
+    """
+    audit = _load_audit_module()
+    ctx = audit.worker_solver_payload(
+        "current_fast_ctx", "interacting_disorder_sweep_uu"
+    )
+    fast = audit.worker_solver_payload(
+        "current_fast", "interacting_disorder_sweep_uu"
+    )
+    assert ctx["energies"].shape == fast["energies"].shape
+    assert ctx["densities"].shape == fast["densities"].shape
+    assert np.allclose(ctx["energies"], fast["energies"], rtol=1e-10, atol=0)
+    assert np.allclose(ctx["densities"], fast["densities"], atol=1e-10, rtol=0)
+
+
+def test_disorder_sweep_payload_agrees_with_current_compat():
+    """SolveContext sweep must agree with the legacy labelled solver
+    (current_compat forces bypass_det=True), not just the fast path.
+    Catches any fast-path-only bug that doesn't show up in ctx-vs-fast.
+    """
+    audit = _load_audit_module()
+    ctx = audit.worker_solver_payload(
+        "current_fast_ctx", "interacting_disorder_sweep_uu"
+    )
+    compat = audit.worker_solver_payload(
+        "current_compat", "interacting_disorder_sweep_uu"
+    )
+    assert np.allclose(
+        ctx["energies"], compat["energies"], rtol=1e-9, atol=1e-10
+    )
+    assert np.allclose(
+        ctx["densities"], compat["densities"], atol=1e-9, rtol=0
+    )

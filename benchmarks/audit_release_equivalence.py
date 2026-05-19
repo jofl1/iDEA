@@ -55,6 +55,11 @@ MODES = (
     "current_fast_scipy",   # IDEA_DET_EIGSH_BACKEND=scipy (force fallback)
     "current_fast_primme",  # IDEA_DET_EIGSH_BACKEND=primme + threshold=0
     "current_no_primme",    # IDEA_DET_DISABLE_PRIMME=1 (treat as absent)
+    # Phase S3 — same default-backend dispatch as current_fast but driven
+    # through SolveContext to exercise the warm-start path. Applied only
+    # to the disorder-sweep case below; other interacting cases stay on
+    # the original six modes.
+    "current_fast_ctx",
 )
 
 _CURRENT_FAST_MODES = (
@@ -62,6 +67,12 @@ _CURRENT_FAST_MODES = (
     "current_fast_scipy",
     "current_fast_primme",
     "current_no_primme",
+    "current_fast_ctx",
+)
+
+_MODES_WITHOUT_CTX = tuple(m for m in MODES if m != "current_fast_ctx")
+_CURRENT_FAST_MODES_WITHOUT_CTX = tuple(
+    m for m in _CURRENT_FAST_MODES if m != "current_fast_ctx"
 )
 CH5_ARRAY_KEYS = (
     "x",
@@ -308,6 +319,10 @@ def solver_cases() -> list[str]:
         # reconstruction at the time-evolution boundary.
         "interacting_propagate_harmonic_uu_kick",
         "interacting_det_harmonic_uud",
+        # Phase S3 — disorder sweep over a fixed (x, dx, electrons,
+        # v_int) template. The current_fast_ctx mode routes the sweep
+        # through SolveContext; other modes loop per-call solves.
+        "interacting_disorder_sweep_uu",
     ]
 
 
@@ -316,10 +331,16 @@ def modes_for_solver_case(case_name: str) -> tuple[str, ...]:
         # No release counterpart (the legacy solver can't reliably
         # produce uud at any speed). Run the dispatched path under
         # every backend permutation so the variants cross-check each
-        # other implicitly via the audit report.
-        return _CURRENT_FAST_MODES
-    if case_name.startswith("interacting_"):
+        # other implicitly via the audit report. SolveContext is not
+        # meaningful for a single-solve case, so omit current_fast_ctx.
+        return _CURRENT_FAST_MODES_WITHOUT_CTX
+    if case_name == "interacting_disorder_sweep_uu":
+        # SolveContext sweep case — includes current_fast_ctx alongside
+        # the six baseline modes so the warm-started sweep is audited
+        # against per-call solves under every backend permutation.
         return MODES
+    if case_name.startswith("interacting_"):
+        return _MODES_WITHOUT_CTX
     return ("release", "current_fast")
 
 
@@ -1191,6 +1212,59 @@ def worker_solver_payload(mode: str, case_name: str) -> dict:
             "v_ext": s.v_ext,
             "energy": np.array(state.energy),
             "density": density,
+        }
+
+    if case_name == "interacting_disorder_sweep_uu":
+        # Phase S3 audit: 8-element disorder sweep over a fixed
+        # template (same x, dx, electrons, v_int; varying v_ext).
+        # current_fast_ctx routes the sweep through SolveContext
+        # (warm-started); every other mode loops per-call solves.
+        # All modes must agree on every element's energy and density.
+        n_points = 12
+        x = np.linspace(-5, 5, n_points)
+        v_int = iDEA.interactions.softened_interaction(x)
+        omega = 0.25
+        base_v_ext = 0.5 * omega**2 * x**2
+        rng = np.random.default_rng(42)
+        disorders = [
+            0.05 * rng.standard_normal(n_points) for _ in range(8)
+        ]
+        systems = [
+            iDEA.system.System(
+                x, base_v_ext + d, v_int, electrons="uu"
+            )
+            for d in disorders
+        ]
+
+        energies = np.empty(len(systems))
+        densities = np.empty((len(systems), n_points))
+
+        if mode == "current_fast_ctx":
+            import iDEA.methods.interacting_det as det
+
+            template = iDEA.system.System(
+                x, base_v_ext, v_int, electrons="uu"
+            )
+            ctx = det.SolveContext(template)
+            for i, s_i in enumerate(systems):
+                state = ctx.solve(s_i)
+                energies[i] = float(state.energy)
+                densities[i] = det.density(s_i, state)
+        else:
+            kwargs = {}
+            if mode == "current_compat":
+                kwargs["bypass_det"] = True
+            for i, s_i in enumerate(systems):
+                state = iDEA.methods.interacting.solve(s_i, k=0, **kwargs)
+                energies[i] = float(state.energy)
+                densities[i] = iDEA.observables.density(s_i, state=state)
+
+        return {
+            "x": x,
+            "energies": energies,
+            "densities": densities,
+            "n_systems": np.array(len(systems)),
+            "mode": np.array(mode),
         }
 
     if case_name == "interacting_det_harmonic_uud":
