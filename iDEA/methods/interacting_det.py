@@ -397,7 +397,61 @@ class _InvariantComponents:
         "n_grid",
         "n_up",
         "n_down",
+        # Lazy parity caches. _build_parity_orbits reads only fields on
+        # this class, so we can populate it lazily without rebuilding
+        # per solve. Both ± projectors are cached independently because
+        # solve() may want one or both per call.
+        "_parity_orbits_cache",
+        "_parity_projector_pos_cache",
+        "_parity_projector_neg_cache",
     )
+
+    def parity_orbits(self):
+        """Return ``(s_ref, partner, self_mask, reps_pos, reps_neg)``.
+
+        Built once and cached on the invariants object; the result
+        depends only on the basis geometry and electron counts, so it
+        is reusable across any number of solves on this template.
+        """
+        cached = getattr(self, "_parity_orbits_cache", None)
+        if cached is None:
+            cached = _build_parity_orbits(
+                self, self.n_grid, self.n_up, self.n_down
+            )
+            self._parity_orbits_cache = cached
+        return cached
+
+    def parity_projector(self, p: int):
+        """Return the sparse projector ``Q_p`` for total parity ``p``.
+
+        Built lazily on first access per sign. ``p`` must be ``+1`` or
+        ``-1``.
+        """
+        if p == +1:
+            cached = getattr(self, "_parity_projector_pos_cache", None)
+            if cached is None:
+                s_ref, partner, self_mask, reps_pos, _reps_neg = (
+                    self.parity_orbits()
+                )
+                cached = _build_parity_projection(
+                    reps_pos, partner, self_mask, s_ref, +1, self.D
+                )
+                self._parity_projector_pos_cache = cached
+            return cached
+        if p == -1:
+            cached = getattr(self, "_parity_projector_neg_cache", None)
+            if cached is None:
+                s_ref, partner, self_mask, _reps_pos, reps_neg = (
+                    self.parity_orbits()
+                )
+                cached = _build_parity_projection(
+                    reps_neg, partner, self_mask, s_ref, -1, self.D
+                )
+                self._parity_projector_neg_cache = cached
+            return cached
+        raise ValueError(
+            f"parity sign must be +1 or -1, got {p!r}"
+        )
 
 
 class _SolverComponents:
@@ -425,6 +479,10 @@ class _SolverComponents:
         "diag",
         "up_hops",
         "down_hops",
+        # Back-reference to the invariants this _SolverComponents was
+        # composed from. Lets solve() reach the lazy parity accessors
+        # without rebuilding the orbits each call.
+        "_inv",
     )
 
 
@@ -466,6 +524,9 @@ def _build_invariant_components(s: iDEA.system.System) -> _InvariantComponents:
     inv.n_grid = n_grid
     inv.n_up = n_up
     inv.n_down = n_down
+    inv._parity_orbits_cache = None
+    inv._parity_projector_pos_cache = None
+    inv._parity_projector_neg_cache = None
     return inv
 
 
@@ -504,7 +565,18 @@ def _build_op_for_potential(inv: _InvariantComponents, v_ext, v_int):
 
 def _build_solver_components(s: iDEA.system.System) -> _SolverComponents:
     inv = _build_invariant_components(s)
-    diag, matvec, op = _build_op_for_potential(inv, s.v_ext, s.v_int)
+    return _compose_solver_components(inv, s.v_ext, s.v_int)
+
+
+def _compose_solver_components(
+    inv: _InvariantComponents, v_ext, v_int
+) -> _SolverComponents:
+    """Build a ``_SolverComponents`` from cached invariants + potentials.
+
+    Used by both ``_build_solver_components`` (single-shot) and
+    ``SolveContext.solve`` (sweep, reusing ``inv`` across calls).
+    """
+    diag, matvec, op = _build_op_for_potential(inv, v_ext, v_int)
 
     comps = _SolverComponents()
     comps.op = op
@@ -521,6 +593,7 @@ def _build_solver_components(s: iDEA.system.System) -> _SolverComponents:
     comps.diag = diag
     comps.up_hops = inv.up_hops
     comps.down_hops = inv.down_hops
+    comps._inv = inv
     return comps
 
 
@@ -776,20 +849,12 @@ def solve(
         v0_full = None
 
     if can_use_parity:
-        n_grid = s.x.shape[0]
-        n_up = s.up_count
-        n_down = s.down_count
-        s_ref, partner, self_mask, reps_pos, reps_neg = _build_parity_orbits(
-            comps, n_grid, n_up, n_down
-        )
-
         # Fast path: solve only the predicted-parity block for k=0 unless
         # the caller asks to verify. k>0 always falls through to both
         # blocks because we have no prediction for excited-state parities.
         if (not verify_parity) and k == 0:
             predicted = _predict_ground_parity(s)
-            reps = reps_pos if predicted == +1 else reps_neg
-            Q_p = _build_parity_projection(reps, partner, self_mask, s_ref, predicted, D)
+            Q_p = comps._inv.parity_projector(predicted)
             v0_block = _project_to_block(v0_full, Q_p)
             energies_p, eigvecs_p = _solve_in_parity_block(
                 comps, Q_p, k=0, tol=tol, v0=v0_block,
@@ -798,8 +863,8 @@ def solve(
             amplitudes = eigvecs_p[:, 0].reshape(D_up, D_down)
             selected_parity = predicted
         else:
-            Q_pos = _build_parity_projection(reps_pos, partner, self_mask, s_ref, +1, D)
-            Q_neg = _build_parity_projection(reps_neg, partner, self_mask, s_ref, -1, D)
+            Q_pos = comps._inv.parity_projector(+1)
+            Q_neg = comps._inv.parity_projector(-1)
             v0_pos = _project_to_block(v0_full, Q_pos)
             v0_neg = _project_to_block(v0_full, Q_neg)
             energies_pos, eigvecs_pos = _solve_in_parity_block(
