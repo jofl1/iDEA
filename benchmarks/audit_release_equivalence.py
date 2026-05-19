@@ -1166,11 +1166,18 @@ def worker_solver_payload(mode: str, case_name: str) -> dict:
         }
 
     if case_name == "interacting_offset_asymmetric_uu":
-        # A8: v_ext = harmonic + 1e6 offset + asymmetric kink. Must take
-        # the non-parity path (covers the rtol fix end-to-end).
+        # A8: v_ext = harmonic + 1e5 offset + asymmetric kink. Must take
+        # the non-parity path (covers the rtol fix end-to-end). The
+        # offset is set large enough to still trigger NumPy's default
+        # rtol=1e-5 if the parity check used it (1e5 * 1e-5 = 1.0,
+        # larger than the 0.1 kink), but small enough that the
+        # eigenvalue ~2e5 is well within ARPACK's numerical precision
+        # regime — a 1e6 offset pushed the labelled CSR solve to the
+        # edge of its precision and produced order-dependent test
+        # failures.
         n_points = 28
         x = np.linspace(-6, 6, n_points)
-        v_ext = 0.5 * 0.25**2 * x**2 + 1e6
+        v_ext = 0.5 * 0.25**2 * x**2 + 1e5
         v_ext[n_points // 3] += 0.1  # asymmetric kink
         v_int = iDEA.interactions.softened_interaction(x)
         s = iDEA.system.System(x, v_ext, v_int, electrons="uu")

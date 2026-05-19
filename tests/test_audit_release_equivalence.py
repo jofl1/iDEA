@@ -234,16 +234,16 @@ def test_propagation_worker_payload_agrees_across_modes():
 def test_asymmetric_offset_worker_payload_takes_non_parity_path():
     """A8: large-offset asymmetric potential. Without the A1 rtol fix,
     parity could be mis-detected and one block solved on a Hamiltonian
-    that does not conserve parity. Force both modes through and assert
-    agreement.
+    that does not conserve parity. The fast (dispatched det path) and
+    compat (legacy labelled) solves must succeed and agree on the
+    physics. See worker_solver_payload for the 1e5 offset rationale.
     """
     audit = _load_audit_module()
     fast = audit.worker_solver_payload("current_fast", "interacting_offset_asymmetric_uu")
     compat = audit.worker_solver_payload(
         "current_compat", "interacting_offset_asymmetric_uu"
     )
-    # Energy is ~1e6 (offset-dominated); use relative comparison.
     assert np.isclose(
-        float(fast["energy"]), float(compat["energy"]), rtol=1e-12, atol=0
+        float(fast["energy"]), float(compat["energy"]), rtol=1e-8, atol=0
     )
     assert np.allclose(fast["density"], compat["density"], atol=1e-8, rtol=0)

@@ -151,10 +151,34 @@ def _solve_with_preconditioner(
             raise_for_unconverged=True,
         )
     else:
-        energies, eigvecs = spsla.eigsh(op, k=k, which="SA", tol=tol)
+        # scipy.sparse.linalg.eigsh accepts v0 as a starting vector; pass
+        # it through so warm-starts work in the scipy-backend regime
+        # too (e.g. parity-block dims below the PRIMME threshold).
+        # Pass v0 only when non-None — explicit v0=None and omitting v0
+        # take slightly different ARPACK RNG trajectories, which can
+        # shift convergence on ill-conditioned cases (e.g. potentials
+        # dominated by a constant offset).
+        eigsh_kwargs = {"k": k, "which": "SA", "tol": tol}
+        if v0 is not None:
+            eigsh_kwargs["v0"] = v0
+        energies, eigvecs = spsla.eigsh(op, **eigsh_kwargs)
 
     order = np.argsort(energies)
-    return energies[order], eigvecs[:, order]
+    energies = energies[order]
+    eigvecs = eigvecs[:, order]
+
+    # Vector orientation alignment. For continuation across related solves
+    # (parameter sweeps, time evolution, repeated KS iterations) a sign
+    # flip in the returned eigenvector adds spurious noise to raw .full
+    # comparisons. When v0 is supplied — i.e. the caller has a prior or
+    # cold-start vector in hand — align the lowest eigenvector's sign so
+    # ``vdot(v0, eigvec_0)`` is non-negative.
+    if v0 is not None and eigvecs.shape[1] >= 1:
+        overlap = complex(np.vdot(v0.ravel(), eigvecs[:, 0]))
+        if overlap.real < 0:
+            eigvecs[:, 0] = -eigvecs[:, 0]
+
+    return energies, eigvecs
 
 
 def _slater_amplitudes(phi_occ: np.ndarray, combs):
