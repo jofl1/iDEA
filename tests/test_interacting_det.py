@@ -607,3 +607,286 @@ def test_benchmark_labelled_solver_forces_legacy_bypass(monkeypatch):
     assert call == {"system": s, "k": 0, "bypass_det": True, "kwargs": {}}
     assert energy == 1.25
     assert np.array_equal(density, np.ones_like(s.x))
+
+
+# ---------------------------------------------------------------------------
+# Phase S3.2: SolveContext warm-start API
+# ---------------------------------------------------------------------------
+
+
+def _ctx_test_system(
+    electrons: str,
+    n_grid: int = 12,
+    v_ext_kind: str = "harmonic",
+    disorder: np.ndarray | None = None,
+    omega: float = 0.25,
+    box: float = 5.0,
+):
+    """Build a small System for SolveContext tests.
+
+    Default harmonic v_ext + softened Coulomb v_int. ``disorder`` is an
+    optional length-``n_grid`` array added to v_ext (used for sweep
+    tests so v_int stays fixed).
+    """
+    x = np.linspace(-box, box, n_grid)
+    if v_ext_kind == "harmonic":
+        v_ext = 0.5 * omega**2 * x**2
+    elif v_ext_kind == "flat":
+        v_ext = np.zeros_like(x)
+    else:
+        raise ValueError(f"unknown v_ext_kind {v_ext_kind!r}")
+    if disorder is not None:
+        v_ext = v_ext + disorder
+    v_int = iDEA.interactions.softened_interaction(x)
+    return iDEA.system.System(x, v_ext, v_int, electrons)
+
+
+@pytest.mark.parametrize("electrons", ["u", "ud", "uu", "uud", "uudd"])
+def test_solve_context_single_call_matches_stock_solve(electrons):
+    """SolveContext(s).solve(s) matches det.solve(s) on the first call.
+
+    Cold-start path: SolveContext mirrors stock dispatch (same v0 gate,
+    same projection cutoff, same safety_extra_k). Energy diff is within
+    the eigensolver's machine-precision convergence (rtol=1e-12 is well
+    above the observed ~few · eps noise).
+    """
+    s = _ctx_test_system(electrons, n_grid=8 if electrons == "uudd" else 12)
+    ctx = det.SolveContext(s)
+    state_ctx = ctx.solve(s)
+    state_stock = det.solve(s)
+    assert np.isclose(state_ctx.energy, state_stock.energy, rtol=1e-12, atol=0)
+    n_ctx = det.density(s, state_ctx)
+    n_stock = det.density(s, state_stock)
+    assert np.allclose(n_ctx, n_stock, rtol=0, atol=1e-12)
+    # det_amplitudes match modulo a global sign (non-degenerate ground).
+    diff_pos = np.max(np.abs(state_ctx.det_amplitudes - state_stock.det_amplitudes))
+    diff_neg = np.max(np.abs(state_ctx.det_amplitudes + state_stock.det_amplitudes))
+    assert min(diff_pos, diff_neg) < 1e-10
+
+
+def test_solve_context_sweep_matches_per_call_solves():
+    """Sweep over disordered v_ext via SolveContext matches per-call solves.
+
+    10-element disorder sweep at electrons='uu', n_grid=12. Energies
+    agree with fresh det.solve(s_i) to rtol=1e-10. Densities to
+    atol=1e-10. Catches warm-start convergence drift.
+    """
+    rng = np.random.default_rng(42)
+    n_grid = 12
+    template = _ctx_test_system("uu", n_grid=n_grid)
+    sweep = [
+        _ctx_test_system("uu", n_grid=n_grid, disorder=0.05 * rng.standard_normal(n_grid))
+        for _ in range(10)
+    ]
+    ctx = det.SolveContext(template)
+    for s_i in sweep:
+        state_ctx = ctx.solve(s_i)
+        state_stock = det.solve(s_i)
+        assert np.isclose(state_ctx.energy, state_stock.energy, rtol=1e-10, atol=0), (
+            f"energy drift: ctx={state_ctx.energy:.16e} "
+            f"stock={state_stock.energy:.16e}"
+        )
+        n_ctx = det.density(s_i, state_ctx)
+        n_stock = det.density(s_i, state_stock)
+        assert np.allclose(n_ctx, n_stock, rtol=0, atol=1e-10)
+
+
+def test_solve_context_sweep_is_deterministic():
+    """Two SolveContext sweeps with the same seed give the same energies.
+
+    Strict bit-equality is unreliable — scipy.eigsh on small matrices
+    exhibits ~few · eps non-determinism across calls even on identical
+    inputs (verified by repeatedly solving the same system in stock
+    det.solve). atol=1e-13 is well above that noise floor (eigenvalues
+    are ~O(1) here) but tight enough to catch any real warm-start
+    state leakage across sweep iterations.
+    """
+    n_grid = 12
+    template = _ctx_test_system("uu", n_grid=n_grid)
+
+    def run_sweep():
+        rng = np.random.default_rng(42)
+        sweep = [
+            _ctx_test_system(
+                "uu", n_grid=n_grid, disorder=0.05 * rng.standard_normal(n_grid)
+            )
+            for _ in range(6)
+        ]
+        ctx = det.SolveContext(template)
+        return np.array([ctx.solve(s_i).energy for s_i in sweep])
+
+    e1 = run_sweep()
+    e2 = run_sweep()
+    assert np.allclose(e1, e2, rtol=0, atol=1e-13)
+
+
+def test_solve_context_sweep_order_independence():
+    """Forward sweep and reverse sweep give the same per-element energy.
+
+    Pinpoints order-dependent warm-start drift: if the warm-start v0
+    biases convergence non-trivially, reversing the sweep order would
+    shift energies away from cold-start truth at each step.
+    """
+    rng = np.random.default_rng(7)
+    n_grid = 12
+    template = _ctx_test_system("uu", n_grid=n_grid)
+    sweep = [
+        _ctx_test_system("uu", n_grid=n_grid, disorder=0.05 * rng.standard_normal(n_grid))
+        for _ in range(8)
+    ]
+    ctx_fwd = det.SolveContext(template)
+    energies_fwd = np.array([ctx_fwd.solve(s).energy for s in sweep])
+    ctx_rev = det.SolveContext(template)
+    energies_rev_local = np.array([ctx_rev.solve(s).energy for s in sweep[::-1]])
+    energies_rev = energies_rev_local[::-1]
+    assert np.allclose(energies_fwd, energies_rev, rtol=1e-10, atol=0)
+
+
+def test_solve_context_rejects_incompatible_v_int():
+    s = _ctx_test_system("ud", n_grid=10)
+    ctx = det.SolveContext(s)
+    x = s.x
+    other_v_int = iDEA.interactions.softened_interaction(x, softening=0.5)
+    s_other = iDEA.system.System(x, s.v_ext, other_v_int, "ud")
+    with pytest.raises(ValueError, match="v_int"):
+        ctx.solve(s_other)
+
+
+def test_solve_context_rejects_incompatible_electrons():
+    s = _ctx_test_system("uu", n_grid=10)
+    ctx = det.SolveContext(s)
+    s_other = iDEA.system.System(s.x, s.v_ext, s.v_int, "ud")
+    with pytest.raises(ValueError, match="electrons"):
+        ctx.solve(s_other)
+
+
+def test_solve_context_rejects_incompatible_grid():
+    s = _ctx_test_system("uu", n_grid=10)
+    ctx = det.SolveContext(s)
+    x_diff = np.linspace(-5.0, 5.0, 12)
+    s_diff_grid = iDEA.system.System(
+        x_diff,
+        0.5 * 0.25**2 * x_diff**2,
+        iDEA.interactions.softened_interaction(x_diff),
+        "uu",
+    )
+    with pytest.raises(ValueError, match=r"\b(x|dx)\b"):
+        ctx.solve(s_diff_grid)
+
+
+def test_solve_context_handles_parity_flip_mid_sweep():
+    """Symmetric → asymmetric → symmetric v_ext sequence.
+
+    The middle (asymmetric) solve breaks parity and uses the
+    full-basis fallback. The next symmetric solve must still produce
+    correct energy: tests that the cached eigvec is stored in
+    full-basis coords, not in parity-block coords from the previous
+    symmetric solve.
+    """
+    rng = np.random.default_rng(11)
+    n_grid = 12
+    template = _ctx_test_system("uu", n_grid=n_grid)
+
+    # 3 symmetric perturbations + 1 asymmetric + 3 symmetric.
+    def sym_disorder():
+        d = 0.03 * rng.standard_normal(n_grid // 2)
+        return np.concatenate([d, d[::-1]])
+
+    def asym_disorder():
+        return 0.1 * rng.standard_normal(n_grid)
+
+    sweep_disorders = (
+        [sym_disorder() for _ in range(3)]
+        + [asym_disorder()]
+        + [sym_disorder() for _ in range(3)]
+    )
+    sweep = [
+        _ctx_test_system("uu", n_grid=n_grid, disorder=d) for d in sweep_disorders
+    ]
+
+    ctx = det.SolveContext(template)
+    for i, s_i in enumerate(sweep):
+        state_ctx = ctx.solve(s_i)
+        state_stock = det.solve(s_i)
+        assert np.isclose(state_ctx.energy, state_stock.energy, rtol=1e-10, atol=0), (
+            f"element {i}: ctx={state_ctx.energy:.16e} "
+            f"stock={state_stock.energy:.16e}"
+        )
+
+
+def test_solve_context_reset_clears_warm_start():
+    """After reset() the next solve takes cold-start path.
+
+    Verified by reading the private state attribute and asserting that
+    the post-reset solve still matches a fresh det.solve(s) (i.e. the
+    reset didn't leave behind a bad eigvec that would corrupt the
+    cold-start).
+    """
+    s = _ctx_test_system("ud", n_grid=10)
+    ctx = det.SolveContext(s)
+    state_a = ctx.solve(s)
+    assert ctx._last_eigvec_full is not None
+    ctx.reset()
+    assert ctx._last_eigvec_full is None
+    state_b = ctx.solve(s)
+    state_stock = det.solve(s)
+    assert np.isclose(state_a.energy, state_b.energy, rtol=1e-12, atol=0)
+    assert np.isclose(state_b.energy, state_stock.energy, rtol=1e-12, atol=0)
+
+
+def test_solve_context_degeneracy_stress():
+    """Near-flat v_ext (almost-degenerate states): warm-started solve
+    still recovers the correct lowest energy.
+
+    Without safety-k, a warm-start v0 with greater overlap on a higher
+    state could cause ARPACK to converge there preferentially. The
+    safety-k mechanism asks for n+1 eigenpairs and picks the lowest,
+    so the right answer is always returned.
+    """
+    rng = np.random.default_rng(3)
+    n_grid = 10
+    template = _ctx_test_system("uu", n_grid=n_grid, v_ext_kind="flat")
+    sweep = [
+        _ctx_test_system(
+            "uu",
+            n_grid=n_grid,
+            v_ext_kind="flat",
+            disorder=1e-3 * rng.standard_normal(n_grid),
+        )
+        for _ in range(5)
+    ]
+    ctx = det.SolveContext(template)
+    for i, s_i in enumerate(sweep):
+        state_ctx = ctx.solve(s_i)
+        state_stock = det.solve(s_i)
+        assert np.isclose(
+            state_ctx.energy, state_stock.energy, rtol=1e-8, atol=1e-12
+        ), (
+            f"element {i}: ctx={state_ctx.energy:.16e} "
+            f"stock={state_stock.energy:.16e}"
+        )
+
+
+def test_solve_context_build_labelled_state_roundtrip():
+    """build_labelled_state on ctx.solve(s) matches stock build_labelled_state.
+
+    Pins the labelled handoff: downstream observables that index
+    state.space or state.full must see the same content whether the
+    state came from stock solve() or ctx.solve(). Sign-invariant on
+    .full because the antisymmetrisation may yield a global sign flip.
+    """
+    s = _ctx_test_system("uu", n_grid=10)
+    ctx = det.SolveContext(s)
+    state_ctx_det = ctx.solve(s)
+    state_stock_det = det.solve(s)
+    labelled_ctx = det.build_labelled_state(s, state_ctx_det)
+    labelled_stock = det.build_labelled_state(s, state_stock_det)
+    assert np.isclose(labelled_ctx.energy, labelled_stock.energy, rtol=1e-12, atol=0)
+    assert np.allclose(
+        labelled_ctx.space, labelled_stock.space, rtol=0, atol=1e-10
+    ) or np.allclose(
+        labelled_ctx.space, -labelled_stock.space, rtol=0, atol=1e-10
+    )
+    diff_pos = np.max(np.abs(labelled_ctx.full - labelled_stock.full))
+    diff_neg = np.max(np.abs(labelled_ctx.full + labelled_stock.full))
+    assert min(diff_pos, diff_neg) < 1e-10

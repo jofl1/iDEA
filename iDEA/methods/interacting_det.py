@@ -739,33 +739,49 @@ def _build_parity_projection(reps, partner, self_mask, s_ref, p, D):
     return sps.csr_matrix((data, (rows, cols)), shape=(D, len(reps)), dtype=float)
 
 
-def _project_to_block(v_full, Q_p):
+def _project_to_block(v_full, Q_p, cutoff: float = 1e-12):
     """Project a full-basis vector into a parity-block, Euclidean-normalised.
 
     Returns ``None`` if ``v_full is None`` (no v0 to project), or if the
-    projection norm is essentially zero (the input has the opposite
+    projection norm is below ``cutoff`` (the input has the opposite
     parity from the block). The eigensolver then falls back to its
     default starting vector.
+
+    ``cutoff`` defaults to ``1e-12`` for cold-start v0 (Slater
+    determinant), which has unit norm only after the channel-amplitude
+    outer product so projection-norm noise is comfortably below the
+    cutoff. SolveContext raises this to ``1e-8`` for warm-starts: a
+    full-basis warm-start eigvec has unit norm, and a misprojection
+    onto the wrong parity block yields a residual ~O(eps · D) that can
+    slip past ``1e-12`` for large bases.
     """
     if v_full is None:
         return None
     v_block = Q_p.T @ v_full
     nrm = float(np.linalg.norm(v_block))
-    if nrm <= 1e-12:
+    if nrm <= cutoff:
         return None
     return v_block / nrm
 
 
-def _solve_in_parity_block(comps, Q_p, k=0, tol=0.0, v0=None):
+def _solve_in_parity_block(
+    comps, Q_p, k=0, tol=0.0, v0=None, safety_extra_k: int = 0
+):
     """Run eigsh on Q_p^T H Q_p (the friend's 'implicit projector' form).
 
-    Returns (energies[: k+1], eigvecs in full basis[:, : k+1]).
+    Returns (energies[: n], eigvecs in full basis[:, : n]) with
+    ``n = k + 1 + safety_extra_k``. ``safety_extra_k > 0`` asks the
+    eigensolver for additional eigenpairs beyond the caller's
+    requested ``k``; used by ``SolveContext`` warm-starts to guard
+    against converging to a higher-energy state preferentially when v0
+    has greater overlap with it near a level crossing. Stock
+    ``solve()`` leaves it at ``0``.
     """
     D_block = Q_p.shape[1]
     if D_block == 0:
         return np.array([], dtype=float), np.zeros((comps.D, 0))
 
-    n_eig = k + 1
+    n_eig = k + 1 + safety_extra_k
 
     def matvec_block(y):
         return Q_p.T @ comps.matvec(Q_p @ y)
@@ -1047,3 +1063,223 @@ def build_labelled_state(
     state.det_down_indicator = det_state.det_down_indicator
     state.parity = getattr(det_state, "parity", 0)
     return state
+
+
+class SolveContext:
+    """Explicit warm-start context for sweeps over related Systems.
+
+    Caches the sweep-invariant solver setup work — basis, hop matrices,
+    indicators, kinetic diagonal, and (lazily) the parity orbits and
+    projectors — and warm-starts each subsequent eigensolve from the
+    previous solve's full-basis eigenvector. Compatible sweep elements
+    share ``x``, ``dx``, ``stencil``, ``electrons`` and ``v_int`` with
+    the template; only ``v_ext`` varies.
+
+    Single-threaded — create one context per worker if parallelising.
+    Not a hash-keyed cache: the snapshot is taken at construction time,
+    and every ``solve(s)`` call validates the incoming system against
+    that snapshot.
+
+    Example:
+
+        ctx = iDEA.methods.interacting_det.SolveContext(s_template)
+        for s in disordered_systems:
+            state = ctx.solve(s)
+
+    Each call returns a ``ManyBodyState`` matching
+    ``interacting_det.solve``'s return type. Use
+    ``ctx.reset()`` to drop the warm-start eigvec.
+
+    Only ``k == 0`` benefits from warm-start; calls with ``k > 0`` fall
+    back to cold-start v0 (Slater determinant) for that solve.
+
+    Future Phase E2 (Jacobi precond) hook: when ``diag_for_prec`` is
+    wired up to ``_solve_with_preconditioner``, this class should pass
+    the freshly-built ``diag`` rather than rebuilding it.
+    """
+
+    def __init__(self, s_template: "iDEA.system.System"):
+        # Defensive copies on mutable arrays so a caller mutating the
+        # template post-construction cannot poison the snapshot
+        # silently. Immutables (dx, stencil, electrons) stored
+        # directly.
+        self._template_x = np.array(s_template.x, copy=True)
+        self._template_dx = float(s_template.dx)
+        self._template_stencil = int(s_template.stencil)
+        self._template_electrons = str(s_template.electrons)
+        self._template_v_int = np.array(s_template.v_int, copy=True)
+        self._inv = _build_invariant_components(s_template)
+        # Predicted ground-state parity is invariant under v_ext
+        # (depends only on N_up, N_down via _predict_ground_parity).
+        self._predicted_parity = _predict_ground_parity(s_template)
+        # Warm-start eigvec, always stored in FULL-BASIS coords. The
+        # parity-block path recovers it via ``Q_p @ eigvec_block``
+        # before caching. Storing block coords would break the next
+        # solve if symmetry changes mid-sweep.
+        self._last_eigvec_full = None
+
+    def reset(self):
+        """Drop the cached warm-start eigvec. Next solve cold-starts."""
+        self._last_eigvec_full = None
+
+    def _validate(self, s: "iDEA.system.System"):
+        if not np.array_equal(s.x, self._template_x):
+            raise ValueError("SolveContext template mismatch: x")
+        if float(s.dx) != self._template_dx:
+            raise ValueError("SolveContext template mismatch: dx")
+        if int(s.stencil) != self._template_stencil:
+            raise ValueError("SolveContext template mismatch: stencil")
+        if str(s.electrons) != self._template_electrons:
+            raise ValueError("SolveContext template mismatch: electrons")
+        if not np.array_equal(s.v_int, self._template_v_int):
+            raise ValueError("SolveContext template mismatch: v_int")
+
+    def solve(
+        self,
+        s: "iDEA.system.System",
+        k: int = 0,
+        tol: float = 0.0,
+        use_parity: bool = True,
+        verify_parity: bool = False,
+    ) -> "iDEA.state.ManyBodyState":
+        """Solve for ``s`` reusing cached invariants and the last eigvec.
+
+        Mirrors ``interacting_det.solve``'s dispatch. The first call
+        (or any call with ``k > 0``, or any call after ``reset()``)
+        cold-starts the eigensolver. Subsequent calls with ``k == 0``
+        warm-start from the previously-cached full-basis eigvec.
+        """
+        self._validate(s)
+        inv = self._inv
+        comps = _compose_solver_components(inv, s.v_ext, s.v_int)
+        D = inv.D
+        D_up = inv.D_up
+        D_down = inv.D_down
+
+        can_use_parity = (
+            use_parity
+            and _v_ext_is_parity_symmetric(s)
+            and _v_int_is_parity_symmetric(s)
+        )
+
+        # Warm-start is only useful for k=0 (we cache only the lowest
+        # eigvec). For k > 0 fall through to stock cold-start logic so
+        # the eigensolver isn't biased by a poorly-matching v0.
+        warm_starting = (k == 0) and (self._last_eigvec_full is not None)
+
+        if warm_starting:
+            v0_full = self._last_eigvec_full
+        else:
+            # Mirror stock solve()'s cold-start v0 gate exactly so
+            # single-call equivalence holds bit-for-bit.
+            expected_solve_dim = (D // 2) if can_use_parity else D
+            will_use_primme = (
+                _resolve_backend(expected_solve_dim) == "primme"
+            )
+            if will_use_primme:
+                v0_full = _noninteracting_slater_det(
+                    s, comps.up_combs, comps.down_combs
+                ).ravel()
+            else:
+                v0_full = None
+
+        # See _project_to_block for the cutoff rationale.
+        projection_cutoff = 1e-8 if warm_starting else 1e-12
+        # Guard against converging to a higher state near a level
+        # crossing when v0 has greater overlap with it.
+        safety_extra_k = 1 if warm_starting else 0
+
+        if can_use_parity:
+            if (not verify_parity) and k == 0:
+                predicted = _predict_ground_parity(s)
+                Q_p = inv.parity_projector(predicted)
+                v0_block = _project_to_block(
+                    v0_full, Q_p, cutoff=projection_cutoff
+                )
+                energies_p, eigvecs_p = _solve_in_parity_block(
+                    comps, Q_p, k=0, tol=tol, v0=v0_block,
+                    safety_extra_k=safety_extra_k,
+                )
+                eigval = float(energies_p[0])
+                amplitudes = eigvecs_p[:, 0].reshape(D_up, D_down)
+                selected_parity = predicted
+                eigvec_full = eigvecs_p[:, 0]
+            else:
+                Q_pos = inv.parity_projector(+1)
+                Q_neg = inv.parity_projector(-1)
+                v0_pos = _project_to_block(
+                    v0_full, Q_pos, cutoff=projection_cutoff
+                )
+                v0_neg = _project_to_block(
+                    v0_full, Q_neg, cutoff=projection_cutoff
+                )
+                energies_pos, eigvecs_pos = _solve_in_parity_block(
+                    comps, Q_pos, k=k, tol=tol, v0=v0_pos,
+                    safety_extra_k=safety_extra_k,
+                )
+                energies_neg, eigvecs_neg = _solve_in_parity_block(
+                    comps, Q_neg, k=k, tol=tol, v0=v0_neg,
+                    safety_extra_k=safety_extra_k,
+                )
+                all_energies = np.concatenate(
+                    [energies_pos, energies_neg]
+                )
+                all_eigvecs = np.concatenate(
+                    [eigvecs_pos, eigvecs_neg], axis=1
+                )
+                parities = np.concatenate(
+                    [
+                        np.full(len(energies_pos), +1),
+                        np.full(len(energies_neg), -1),
+                    ]
+                )
+                order = np.argsort(all_energies)
+                eigval = float(all_energies[order[k]])
+                amplitudes = all_eigvecs[:, order[k]].reshape(
+                    D_up, D_down
+                )
+                selected_parity = int(parities[order[k]])
+                eigvec_full = all_eigvecs[:, order[k]]
+
+                if verify_parity and k == 0:
+                    predicted = _predict_ground_parity(s)
+                    assert selected_parity == predicted, (
+                        f"ground-state parity mismatch: solver returned "
+                        f"{selected_parity}, prediction "
+                        f"(eps_Nup * eps_Ndown) is {predicted}"
+                    )
+        else:
+            # Full-basis fallback for asymmetric systems or
+            # use_parity=False.
+            n_eig = k + 1 + safety_extra_k
+            if n_eig >= D - 1:
+                dense = np.empty((D, D), dtype=float)
+                for col in range(D):
+                    e = np.zeros(D)
+                    e[col] = 1.0
+                    dense[:, col] = comps.matvec(e)
+                energies, eigvecs = np.linalg.eigh(dense)
+                eigvecs = eigvecs[:, :n_eig]
+                energies = energies[:n_eig]
+            else:
+                energies, eigvecs = _solve_with_preconditioner(
+                    comps.op, k=n_eig, tol=tol, v0=v0_full,
+                )
+            eigval = float(energies[k])
+            amplitudes = eigvecs[:, k].reshape(D_up, D_down)
+            selected_parity = 0  # parity unknown / not applicable
+            eigvec_full = eigvecs[:, k]
+
+        # Persist the full-basis eigvec for the next solve. Copy so a
+        # caller mutating the returned state's det_amplitudes can't
+        # poison the cache.
+        self._last_eigvec_full = np.array(eigvec_full, copy=True)
+
+        state = iDEA.state.ManyBodyState(energy=eigval)
+        state.det_amplitudes = amplitudes
+        state.det_up_combs = comps.up_combs
+        state.det_down_combs = comps.down_combs
+        state.det_up_indicator = comps.up_indicator
+        state.det_down_indicator = comps.down_indicator
+        state.parity = selected_parity
+        return state
