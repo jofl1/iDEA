@@ -40,6 +40,7 @@ except ImportError:
 
 
 name = "interacting_det"
+_EIGSH_BACKENDS = ("scipy", "primme")
 
 
 def _get_primme_min_dim() -> int:
@@ -52,13 +53,30 @@ def _get_primme_min_dim() -> int:
     return int(os.environ.get("IDEA_DET_PRIMME_MIN_DIM", "2000"))
 
 
+def _validated_backend_name(backend: str, source: str) -> str:
+    resolved = str(backend).strip().lower()
+    if resolved not in _EIGSH_BACKENDS:
+        expected = ", ".join(repr(name) for name in _EIGSH_BACKENDS)
+        raise ValueError(
+            f"Unsupported eigensolver backend {backend!r} from {source}; "
+            f"expected one of: {expected}."
+        )
+    if resolved == "primme" and not _HAS_PRIMME:
+        raise ImportError(
+            "PRIMME eigensolver backend was requested, but the 'primme' "
+            "package is not installed. Install the optional fast dependency "
+            "or choose backend='scipy'."
+        )
+    return resolved
+
+
 def _resolve_backend(D: int, explicit: str = None) -> str:
     """Pick eigensolver backend. Precedence: explicit > env > auto."""
     if explicit is not None:
-        return explicit
+        return _validated_backend_name(explicit, "explicit backend argument")
     env = os.environ.get("IDEA_DET_EIGSH_BACKEND")
     if env:
-        return env
+        return _validated_backend_name(env, "IDEA_DET_EIGSH_BACKEND")
     if _HAS_PRIMME and D >= _get_primme_min_dim():
         return "primme"
     return "scipy"
@@ -83,7 +101,7 @@ def _solve_with_preconditioner(
     |     op: scipy ``LinearOperator`` (sparse matrix also works).
     |     k: number of eigenpairs to return.
     |     tol: solver tolerance. ``0`` means scipy machine precision;
-    |         remapped to ``1e-12`` for PRIMME (whose ``tol=0`` means
+    |         remapped to ``1e-15`` for PRIMME (whose ``tol=0`` means
     |         the library's looser default).
     |     diag_for_prec: full-basis diagonal of ``op`` for the Jacobi
     |         preconditioner. Used by Phase E2 (PRIMME only); ignored
@@ -112,9 +130,9 @@ def _solve_with_preconditioner(
         #   - test_manybody.py::TestLong:  density tol 2.0e-13
         # An eigenpair converged at tol=t has residual ~|max_eig|*t,
         # which feeds back into density precision roughly linearly.
-        # 1e-14 satisfies TestLong (max_eig is O(50) so residual ~5e-13)
-        # while still converging within maxiter on uudd_30 — the
-        # empirically validated sweet spot.
+        # 1e-15 is the empirically validated default used for the
+        # transparent fast path; looser values can fail the long density
+        # tests' analytical-comparison tolerances.
         primme_tol = tol if tol > 0 else 1e-15
         v0_arg = v0.reshape(-1, 1) if v0 is not None else None
         # Phase E2 will construct a Jacobi preconditioner from
@@ -624,11 +642,7 @@ def solve(
     # scipy.eigsh doesn't accept v0 in this code path and the
     # Slater-determinant minors are wasted work.
     expected_solve_dim = (D // 2) if can_use_parity else D
-    primme_min = _get_primme_min_dim()
-    will_use_primme = _HAS_PRIMME and (
-        os.environ.get("IDEA_DET_EIGSH_BACKEND") == "primme"
-        or expected_solve_dim >= primme_min
-    )
+    will_use_primme = _resolve_backend(expected_solve_dim) == "primme"
     if will_use_primme:
         v0_full = _noninteracting_slater_det(
             s, comps.up_combs, comps.down_combs

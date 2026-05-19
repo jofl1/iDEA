@@ -97,7 +97,7 @@ def solve_and_measure(s, solver="labelled"):
     if solver == "labelled":
         start = time.perf_counter()
         with contextlib.redirect_stdout(io.StringIO()):
-            state = iDEA.methods.interacting.solve(s, k=0)
+            state = iDEA.methods.interacting.solve(s, k=0, bypass_det=True)
         elapsed = time.perf_counter() - start
         density = iDEA.observables.density(s, state=state)
         return elapsed, float(state.energy), density

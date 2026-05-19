@@ -457,3 +457,62 @@ def test_backend_equivalence(electrons, monkeypatch):
 
     assert np.isclose(state_scipy.energy, state_primme.energy, rtol=1e-10, atol=1e-12)
     assert np.allclose(n_scipy, n_primme, rtol=1e-10, atol=1e-12)
+
+
+def test_backend_resolution_rejects_invalid_env_value(monkeypatch):
+    monkeypatch.setenv("IDEA_DET_EIGSH_BACKEND", "primm")
+
+    with pytest.raises(ValueError, match="IDEA_DET_EIGSH_BACKEND"):
+        det._resolve_backend(10)
+
+
+def test_backend_resolution_rejects_invalid_explicit_value():
+    with pytest.raises(ValueError, match="explicit backend argument"):
+        det._resolve_backend(10, explicit="arpack")
+
+
+def test_backend_resolution_rejects_requested_missing_primme(monkeypatch):
+    monkeypatch.setattr(det, "_HAS_PRIMME", False)
+
+    with pytest.raises(ImportError, match="PRIMME eigensolver backend"):
+        det._resolve_backend(10, explicit="primme")
+
+
+def test_backend_resolution_normalizes_env_value(monkeypatch):
+    monkeypatch.setenv("IDEA_DET_EIGSH_BACKEND", " SciPy ")
+
+    assert det._resolve_backend(10**9) == "scipy"
+
+
+def test_benchmark_labelled_solver_forces_legacy_bypass(monkeypatch):
+    benchmark = _load_benchmark_module()
+    x = np.linspace(-4, 4, 8)
+    s = iDEA.system.System(
+        x,
+        0.5 * 0.25**2 * x**2,
+        iDEA.interactions.softened_interaction(x),
+        electrons="uu",
+    )
+    fake_state = iDEA.state.ManyBodyState(energy=1.25)
+    call = {}
+
+    def fake_solve(system, k=0, bypass_det=False, **kwargs):
+        call["system"] = system
+        call["k"] = k
+        call["bypass_det"] = bypass_det
+        call["kwargs"] = kwargs
+        return fake_state
+
+    def fake_density(system, state=None, **kwargs):
+        assert system is s
+        assert state is fake_state
+        return np.ones_like(system.x)
+
+    monkeypatch.setattr(iDEA.methods.interacting, "solve", fake_solve)
+    monkeypatch.setattr("iDEA.observables.density", fake_density)
+
+    _elapsed, energy, density = benchmark.solve_and_measure(s, solver="labelled")
+
+    assert call == {"system": s, "k": 0, "bypass_det": True, "kwargs": {}}
+    assert energy == 1.25
+    assert np.array_equal(density, np.ones_like(s.x))
