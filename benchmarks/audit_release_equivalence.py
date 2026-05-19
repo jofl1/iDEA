@@ -373,12 +373,29 @@ def max_rel_diff(current: np.ndarray, reference: np.ndarray) -> float:
     return float(np.max(np.abs(current - reference) / denom))
 
 
+_SIGN_INVARIANT_KEY_TOKENS = ("space", "full", "det_amplitudes")
+
+
+def is_sign_invariant_array_key(key: str) -> bool:
+    """True if a single global sign flip is physically irrelevant for the
+    array stored under ``key``.
+
+    Applied to single-wavefunction arrays (``state.full``, ``state.space``,
+    ``det_amplitudes``). Not applied to orbital matrices, where each
+    column carries its own independent sign and a global flip is too
+    coarse a check.
+    """
+    lowered = key.lower()
+    return any(token in lowered for token in _SIGN_INVARIANT_KEY_TOKENS)
+
+
 def compare_arrays(
     reference,
     current,
     *,
     rtol: float = 1e-10,
     atol: float = 1e-12,
+    sign_invariant: bool = False,
 ) -> dict:
     ref = np.asarray(reference)
     cur = np.asarray(current)
@@ -389,6 +406,7 @@ def compare_arrays(
         "current_dtype": str(cur.dtype),
         "exact": False,
         "physics": False,
+        "sign_flip": False,
         "max_abs": None,
         "max_rel": None,
         "status": "contract_change",
@@ -397,16 +415,34 @@ def compare_arrays(
         return result
 
     result["exact"] = bool(np.array_equal(ref, cur))
+    if not result["exact"] and sign_invariant:
+        # Try the sign-flipped match. For non-degenerate eigenstates a
+        # global sign flip is a physically irrelevant convention; raw
+        # array equality would otherwise classify it as a diff.
+        if np.array_equal(-cur, ref):
+            result["exact"] = True
+            result["sign_flip"] = True
     if ref.size == 0:
         result["physics"] = result["exact"]
         result["status"] = "exact" if result["exact"] else "diff"
         return result
 
     if np.issubdtype(ref.dtype, np.number):
-        diff = np.abs(cur - ref)
-        result["max_abs"] = float(np.max(diff))
-        result["max_rel"] = max_rel_diff(cur, ref)
-        result["physics"] = bool(np.allclose(cur, ref, rtol=rtol, atol=atol))
+        diff_pos = np.abs(cur - ref)
+        max_abs = float(np.max(diff_pos))
+        max_rel = max_rel_diff(cur, ref)
+        physics = bool(np.allclose(cur, ref, rtol=rtol, atol=atol))
+        if sign_invariant and not physics:
+            diff_neg = np.abs(cur + ref)
+            max_abs_neg = float(np.max(diff_neg))
+            if max_abs_neg < max_abs:
+                max_abs = max_abs_neg
+                max_rel = max_rel_diff(-cur, ref)
+                result["sign_flip"] = True
+            physics = bool(np.allclose(-cur, ref, rtol=rtol, atol=atol))
+        result["max_abs"] = max_abs
+        result["max_rel"] = max_rel
+        result["physics"] = physics
     else:
         result["physics"] = result["exact"]
     if result["exact"]:
@@ -442,7 +478,11 @@ def compare_npz_pair(
                 }
             )
             continue
-        row = compare_arrays(reference[key], current[key])
+        row = compare_arrays(
+            reference[key],
+            current[key],
+            sign_invariant=is_sign_invariant_array_key(key),
+        )
         row.update({"kind": kind, "case": case_name, "mode": mode, "array": key})
         note = comparison_note(row)
         if note:

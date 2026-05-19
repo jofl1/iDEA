@@ -36,6 +36,51 @@ def test_compare_arrays_classifies_exact_physics_and_contract_change():
     assert contract["status"] == "contract_change"
 
 
+def test_sign_invariant_compare_accepts_global_sign_flip():
+    """A4: wavefunction sign flips are physically irrelevant for
+    non-degenerate eigenstates. The audit comparator must classify a
+    sign-flipped array as exact (with sign_flip=True), not diff.
+    """
+    audit = _load_audit_module()
+    ref = np.array([1.0, 2.0, -0.5])
+    cur = -ref
+
+    diff = audit.compare_arrays(ref, cur)
+    assert diff["status"] == "diff"
+    assert diff["sign_flip"] is False
+
+    sign_inv = audit.compare_arrays(ref, cur, sign_invariant=True)
+    assert sign_inv["status"] == "exact"
+    assert sign_inv["sign_flip"] is True
+
+
+def test_sign_invariant_compare_picks_smaller_diff_on_near_flip():
+    """If the reference is closer to -cur than +cur, the sign-invariant
+    metric must report the smaller diff and mark sign_flip True.
+    """
+    audit = _load_audit_module()
+    ref = np.array([1.0, 2.0, -0.5])
+    cur = -ref + 1e-13  # very close to -ref
+
+    row = audit.compare_arrays(ref, cur, sign_invariant=True)
+    assert row["status"] == "physics"
+    assert row["sign_flip"] is True
+    assert row["max_abs"] < 1e-12
+
+
+def test_is_sign_invariant_array_key_recognises_wavefunctions():
+    audit = _load_audit_module()
+    assert audit.is_sign_invariant_array_key("space")
+    assert audit.is_sign_invariant_array_key("full")
+    assert audit.is_sign_invariant_array_key("det_amplitudes")
+    assert audit.is_sign_invariant_array_key("td_space")  # time evolution
+    # observables and metadata are not sign-invariant.
+    assert not audit.is_sign_invariant_array_key("density")
+    assert not audit.is_sign_invariant_array_key("energy")
+    assert not audit.is_sign_invariant_array_key("v_xc")
+    assert not audit.is_sign_invariant_array_key("up_orbitals")
+
+
 def test_ch5_case_list_contains_master_and_large_box_cases():
     audit = _load_audit_module()
     cases = audit.ch5_cases()
