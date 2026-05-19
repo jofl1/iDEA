@@ -1185,9 +1185,18 @@ class SolveContext:
 
         # See _project_to_block for the cutoff rationale.
         projection_cutoff = 1e-8 if warm_starting else 1e-12
-        # Guard against converging to a higher state near a level
-        # crossing when v0 has greater overlap with it.
-        safety_extra_k = 1 if warm_starting else 0
+        # No safety_extra_k on warm-start. We initially asked for k+1
+        # eigenpairs as a guard against ARPACK/PRIMME mis-converging to
+        # a higher state with which v0 has greater overlap. In practice
+        # the extra eigenpair caused PRIMME to "converge" a second
+        # eigenpair to a near-zero ghost eigenvalue, which leaked back
+        # through the lowest-energy pick and returned wrong energies on
+        # uud_40-scale problems. ARPACK's which="SA" semantics already
+        # post-filter to the smallest-algebraic eigenpair, so the guard
+        # was redundant for scipy and actively harmful for PRIMME.
+        # Robust answers everywhere outweigh the (theoretical) gain
+        # near degeneracies.
+        safety_extra_k = 0
 
         if can_use_parity:
             if (not verify_parity) and k == 0:
