@@ -413,11 +413,24 @@ def _build_solver_components(s: iDEA.system.System) -> _SolverComponents:
 
 
 def _v_ext_is_parity_symmetric(s: iDEA.system.System, atol: float = 1e-10) -> bool:
-    return bool(np.allclose(s.v_ext, s.v_ext[::-1], atol=atol))
+    """Absolute-difference reflection-symmetry check on ``v_ext``.
+
+    Uses an explicit absolute tolerance (``rtol=0``) rather than
+    ``np.allclose``'s default relative tolerance. A shifted potential
+    such as ``v_ext + 1e6`` plus an asymmetric kink would otherwise
+    pass the symmetry test with NumPy's default ``rtol=1e-5``, and the
+    parity fast path would solve only one block of a Hamiltonian where
+    parity is not actually conserved → wrong ground state.
+    """
+    return bool(np.allclose(s.v_ext, s.v_ext[::-1], atol=atol, rtol=0.0))
 
 
 def _v_int_is_parity_symmetric(s: iDEA.system.System, atol: float = 1e-10) -> bool:
-    return bool(np.allclose(s.v_int, s.v_int[::-1, ::-1], atol=atol))
+    """Absolute-difference reflection-symmetry check on ``v_int``.
+
+    See ``_v_ext_is_parity_symmetric`` for the rtol rationale.
+    """
+    return bool(np.allclose(s.v_int, s.v_int[::-1, ::-1], atol=atol, rtol=0.0))
 
 
 def _reflect_comb(comb, n_grid):

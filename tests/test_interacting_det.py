@@ -282,6 +282,65 @@ def test_parity_solver_matches_full_solver(case_name):
     )
 
 
+def test_parity_symmetry_check_rejects_large_offset_asymmetry():
+    """Regression: large-offset potential with small asymmetric kink must
+    fail the parity-symmetry check.
+
+    Default np.allclose uses rtol=1e-5, which would let a 0.1-magnitude
+    asymmetric kink ride on top of a 1e6 offset slip past the symmetry
+    test and route the system into the parity fast path — solving only
+    one block of a Hamiltonian that does not actually commute with
+    parity. The check must compare absolute difference only.
+    """
+    x = np.linspace(-8, 8, 40)
+    base = 0.5 * 0.25**2 * x**2
+    v_ext_asym = base + 1e6
+    v_ext_asym[15] += 0.1  # asymmetric kink, magnitude 0.1 vs atol 1e-10
+    v_int = iDEA.interactions.softened_interaction(x)
+    s = iDEA.system.System(x, v_ext_asym, v_int, electrons="uu")
+
+    assert not det._v_ext_is_parity_symmetric(s), (
+        "asymmetric v_ext with 1e6 offset must be classified as not "
+        "parity-symmetric; default-rtol np.allclose would mis-classify it"
+    )
+
+
+def test_parity_symmetry_check_accepts_pristine_symmetric():
+    """Positive control for the parity-symmetry check."""
+    x = np.linspace(-8, 8, 40)
+    v_ext = 0.5 * 0.25**2 * x**2
+    v_int = iDEA.interactions.softened_interaction(x)
+    s = iDEA.system.System(x, v_ext, v_int, electrons="uu")
+
+    assert det._v_ext_is_parity_symmetric(s)
+    assert det._v_int_is_parity_symmetric(s)
+
+
+def test_solve_falls_back_to_full_basis_on_asymmetric_offset():
+    """End-to-end: asymmetric large-offset system must not crash and must
+    match the use_parity=False reference solve (i.e. parity fast path is
+    correctly skipped, not silently chosen).
+    """
+    x = np.linspace(-8, 8, 30)
+    base = 0.5 * 0.25**2 * x**2
+    v_ext_asym = base + 1e6
+    v_ext_asym[10] += 0.1
+    v_int = iDEA.interactions.softened_interaction(x)
+    s = iDEA.system.System(x, v_ext_asym, v_int, electrons="uu")
+
+    state_parity_path = det.solve(s, k=0, use_parity=True)
+    state_full_path = det.solve(s, k=0, use_parity=False)
+
+    assert np.isclose(
+        state_parity_path.energy, state_full_path.energy, rtol=1e-10, atol=1e-10
+    ), (
+        f"parity-path energy {state_parity_path.energy:.10e} "
+        f"vs full-path energy {state_full_path.energy:.10e} — "
+        f"if these disagree, the parity fast path is being taken on a "
+        f"system where parity is not conserved."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Phase D — labelled-state reconstruction tests
 # ---------------------------------------------------------------------------

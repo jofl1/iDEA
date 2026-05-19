@@ -515,26 +515,58 @@ def external_energy(s: iDEA.system.System, n: np.ndarray, v_ext: np.ndarray) -> 
 _HARTREE_FFT_MIN_N = 384
 
 
-def _v_int_is_static_kernel(v_int: np.ndarray) -> bool:
-    # Quick check: v_int is (approximately) symmetric Toeplitz and large
-    # enough for FFT convolution to outpace direct matvec. Below the
-    # threshold, BLAS dgemv is cache-resident and wins.
+def _is_symmetric_toeplitz(v_int: np.ndarray, atol: float = 1e-10) -> bool:
+    """Exact symmetric-Toeplitz check on a 2D ``v_int`` array.
+
+    The FFT Hartree fast path assumes ``v_int[i, j]`` depends only on
+    ``|i - j|``. A previous "few-entry sample" heuristic could be
+    spoofed by a custom non-Toeplitz kernel that happened to match
+    the sampled entries — silently returning wrong Hartree potentials.
+    This check is ``O(N^2)`` but runs at most once per ``v_int`` thanks
+    to caching in ``_v_int_is_static_kernel``.
+    """
     if v_int.ndim != 2:
         return False
     n = v_int.shape[0]
-    if n < _HARTREE_FFT_MIN_N or v_int.shape[1] != n:
+    if v_int.shape[1] != n:
         return False
     if not np.issubdtype(v_int.dtype, np.floating):
         return False
-    tol = 1e-10
-    for k in (1, 2, 3):
-        if not np.isclose(v_int[0, k], v_int[k, 0], atol=tol, rtol=tol):
-            return False
-        if not np.isclose(v_int[0, 0], v_int[k, k], atol=tol, rtol=tol):
-            return False
-        if not np.isclose(v_int[0, 1], v_int[k, k + 1], atol=tol, rtol=tol):
-            return False
+    if not np.allclose(v_int, v_int.T, atol=atol, rtol=0.0):
+        return False
+    if n > 1 and not np.allclose(
+        v_int[:-1, :-1], v_int[1:, 1:], atol=atol, rtol=0.0
+    ):
+        return False
     return True
+
+
+def _v_int_is_static_kernel(s: iDEA.system.System) -> bool:
+    """Decide whether the FFT Hartree fast path is safe for ``s.v_int``.
+
+    Caches the verdict on the System via ``_hartree_fft_kernel_cache``
+    keyed by ``id(s.v_int)`` so that the ``O(N^2)`` exact check runs
+    only once per array. If the user reassigns ``s.v_int`` to a new
+    array, the ``id`` changes and the cache is invalidated naturally.
+
+    Returns False (i.e. uses the direct matvec path) when the grid is
+    smaller than ``_HARTREE_FFT_MIN_N`` since BLAS ``dgemv`` is
+    cache-resident and wins below that threshold.
+    """
+    v_int = s.v_int
+    n = v_int.shape[0] if v_int.ndim == 2 else 0
+    if n < _HARTREE_FFT_MIN_N:
+        return False
+    cache_key = id(v_int)
+    cached = getattr(s, "_hartree_fft_kernel_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+    result = _is_symmetric_toeplitz(v_int)
+    try:
+        s._hartree_fft_kernel_cache = (cache_key, result)
+    except (AttributeError, TypeError):
+        pass
+    return result
 
 
 def _hartree_potential_fft(s: iDEA.system.System, n: np.ndarray) -> np.ndarray:
@@ -557,12 +589,12 @@ def hartree_potential(s: iDEA.system.System, n: np.ndarray) -> np.ndarray:
     |     v_h: np.ndarray, Hartree potential, or evolution of Hartree potential.
     """
     if len(n.shape) == 1:
-        if _v_int_is_static_kernel(s.v_int):
+        if _v_int_is_static_kernel(s):
             return _hartree_potential_fft(s, n)
         return np.dot(n, s.v_int) * s.dx
 
     elif len(n.shape) == 2:
-        if _v_int_is_static_kernel(s.v_int):
+        if _v_int_is_static_kernel(s):
             v_h = np.zeros_like(n)
             for j in range(v_h.shape[0]):
                 v_h[j, :] = _hartree_potential_fft(s, n[j, :])

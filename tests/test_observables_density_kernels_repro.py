@@ -186,6 +186,80 @@ def test_complex_static_state_uses_reference_kernel(monkeypatch, kernel):
     assert result is sentinel
 
 
+# ---------------------------------------------------------------------------
+# Hartree FFT detector hardening (A2)
+# ---------------------------------------------------------------------------
+
+
+def _large_softened_system(n=400):
+    x = np.linspace(-10, 10, n)
+    v_ext = 0.5 * 0.25**2 * x**2
+    v_int = iDEA.interactions.softened_interaction(x)
+    return iDEA.system.System(x, v_ext, v_int, electrons="u")
+
+
+def test_hartree_fft_detector_accepts_genuine_softened_kernel():
+    s = _large_softened_system(n=400)
+    assert iDEA.observables._v_int_is_static_kernel(s)
+
+
+def test_hartree_fft_detector_rejects_spoofed_non_toeplitz():
+    """A v_int that matches the first few entries of a Toeplitz kernel but
+    differs in the bulk must be rejected — otherwise the FFT fast path
+    would silently return wrong Hartree potentials.
+    """
+    s = _large_softened_system(n=400)
+    spoof = s.v_int.copy()
+    spoof[200, 100] = 999.0
+    spoof[100, 200] = 999.0
+    s_spoof = iDEA.system.System(s.x, s.v_ext, spoof, electrons="u")
+    assert not iDEA.observables._v_int_is_static_kernel(s_spoof)
+
+
+def test_hartree_fft_detector_caches_per_v_int():
+    """The exact O(N^2) Toeplitz check runs at most once per v_int."""
+    s = _large_softened_system(n=400)
+    assert iDEA.observables._v_int_is_static_kernel(s)
+    assert hasattr(s, "_hartree_fft_kernel_cache")
+    cache_key, result = s._hartree_fft_kernel_cache
+    assert cache_key == id(s.v_int)
+    assert result is True
+
+    s.v_int = s.v_int.copy()
+    iDEA.observables._v_int_is_static_kernel(s)
+    assert s._hartree_fft_kernel_cache[0] == id(s.v_int)
+
+
+def test_hartree_potential_correct_on_spoofed_non_toeplitz():
+    """End-to-end: with a non-Toeplitz v_int that would have fooled the
+    old few-entry detector, hartree_potential must take the direct dot
+    path and match the explicit matvec.
+    """
+    s = _large_softened_system(n=400)
+    spoof = s.v_int.copy()
+    spoof[200, 100] = 999.0
+    spoof[100, 200] = 999.0
+    s_spoof = iDEA.system.System(s.x, s.v_ext, spoof, electrons="u")
+
+    rng = np.random.default_rng(0)
+    n_density = rng.random(s_spoof.x.shape[0])
+    v_h = iDEA.observables.hartree_potential(s_spoof, n_density)
+    v_h_direct = np.dot(n_density, s_spoof.v_int) * s_spoof.dx
+    assert np.allclose(v_h, v_h_direct, atol=1e-12, rtol=0.0)
+
+
+def test_hartree_potential_fft_path_matches_direct_on_genuine_kernel():
+    """Positive control: the FFT fast path agrees with direct matvec on a
+    genuine symmetric-Toeplitz softened interaction.
+    """
+    s = _large_softened_system(n=400)
+    rng = np.random.default_rng(1)
+    n_density = rng.random(s.x.shape[0])
+    v_h_fft = iDEA.observables.hartree_potential(s, n_density)
+    v_h_direct = np.dot(n_density, s.v_int) * s.dx
+    assert np.allclose(v_h_fft, v_h_direct, atol=1e-10, rtol=0.0)
+
+
 @pytest.mark.parametrize("kernel", ["density", "density_matrix"])
 def test_nonfinite_zero_occupation_orbital_uses_reference_kernel(
     monkeypatch, kernel
