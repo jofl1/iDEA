@@ -68,6 +68,50 @@ def test_sign_invariant_compare_picks_smaller_diff_on_near_flip():
     assert row["max_abs"] < 1e-12
 
 
+def test_audit_env_sets_backend_env_for_each_mode():
+    """A5/A6: each of the new mode variants must set the env vars that
+    drive the iDEA_DET_* dispatch hooks. Pins the audit hook surface so
+    a refactor can't silently break which mode forces which backend.
+    """
+    audit = _load_audit_module()
+
+    scipy_env = audit.audit_env("current_fast_scipy")
+    assert scipy_env["IDEA_DET_EIGSH_BACKEND"] == "scipy"
+    assert "IDEA_DET_DISABLE_PRIMME" not in scipy_env
+
+    primme_env = audit.audit_env("current_fast_primme")
+    assert primme_env["IDEA_DET_EIGSH_BACKEND"] == "primme"
+    assert primme_env["IDEA_DET_PRIMME_MIN_DIM"] == "0"
+
+    no_primme_env = audit.audit_env("current_no_primme")
+    assert no_primme_env["IDEA_DET_DISABLE_PRIMME"] == "1"
+    assert "IDEA_DET_EIGSH_BACKEND" not in no_primme_env
+
+    # current_fast (default) must NOT set any of the dispatch overrides.
+    fast_env = audit.audit_env("current_fast")
+    assert "IDEA_DET_EIGSH_BACKEND" not in fast_env
+    assert "IDEA_DET_PRIMME_MIN_DIM" not in fast_env
+    assert "IDEA_DET_DISABLE_PRIMME" not in fast_env
+
+
+def test_import_paths_for_each_current_fast_variant():
+    audit = _load_audit_module()
+    for mode in ("current_fast", "current_fast_scipy", "current_fast_primme", "current_no_primme"):
+        paths = audit.import_paths_for_mode(mode)
+        assert paths[0] == str(audit.REPO_ROOT), (
+            f"mode {mode}: expected REPO_ROOT first, got {paths[0]!r}"
+        )
+
+
+def test_modes_for_interacting_cases_include_backend_variants():
+    audit = _load_audit_module()
+    for case in ("interacting_harmonic_uu", "interacting_harmonic_du"):
+        modes = audit.modes_for_solver_case(case)
+        assert "current_fast_scipy" in modes
+        assert "current_fast_primme" in modes
+        assert "current_no_primme" in modes
+
+
 def test_is_sign_invariant_array_key_recognises_wavefunctions():
     audit = _load_audit_module()
     assert audit.is_sign_invariant_array_key("space")

@@ -31,12 +31,20 @@ import iDEA.methods.non_interacting
 import iDEA.state
 import iDEA.system
 
-try:
-    import primme
-
-    _HAS_PRIMME = True
-except ImportError:
+if os.environ.get("IDEA_DET_DISABLE_PRIMME", "").strip():
+    # Audit-mode hook: treat PRIMME as absent even if installed, so the
+    # scipy fallback path can be exercised end-to-end without uninstalling
+    # the optional dependency. See A6 in
+    # notes/second_friend_followup.md.
+    primme = None
     _HAS_PRIMME = False
+else:
+    try:
+        import primme
+
+        _HAS_PRIMME = True
+    except ImportError:
+        _HAS_PRIMME = False
 
 
 name = "interacting_det"

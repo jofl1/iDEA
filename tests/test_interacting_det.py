@@ -519,11 +519,10 @@ def test_backend_equivalence(electrons, monkeypatch):
     preconditioner, no warm start, just the library swap. If PRIMME is
     not installed, the test still runs but reports only scipy.
     """
-    primme_available = True
-    try:
-        import primme  # noqa: F401
-    except ImportError:
-        primme_available = False
+    # PRIMME is unavailable in two cases: actually not installed, or the
+    # IDEA_DET_DISABLE_PRIMME audit hook is active. det._HAS_PRIMME
+    # captures both, since the module-load check runs the env var test.
+    primme_available = det._HAS_PRIMME
 
     # Small case so the test runs fast across both backends. Force the
     # primme branch regardless of the size threshold so we actually

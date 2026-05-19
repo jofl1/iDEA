@@ -46,7 +46,23 @@ BUILDER_PATH = Path("/Users/joshfleming/src/jofl1_diss/nearsightedness")
 RELEASE_PACKAGE = "iDEA-latest==1.0.3"
 RELEASE_DEPENDENCY_MODE = "no-deps; release iDEA package uses the current interpreter NumPy/SciPy"
 
-MODES = ("release", "current_compat", "current_fast")
+MODES = (
+    "release",
+    "current_compat",
+    "current_fast",
+    # Phase F (second friend) audit gap A5/A6 — variants of current_fast
+    # exercising the eigensolver-backend dispatch under explicit control.
+    "current_fast_scipy",   # IDEA_DET_EIGSH_BACKEND=scipy (force fallback)
+    "current_fast_primme",  # IDEA_DET_EIGSH_BACKEND=primme + threshold=0
+    "current_no_primme",    # IDEA_DET_DISABLE_PRIMME=1 (treat as absent)
+)
+
+_CURRENT_FAST_MODES = (
+    "current_fast",
+    "current_fast_scipy",
+    "current_fast_primme",
+    "current_no_primme",
+)
 CH5_ARRAY_KEYS = (
     "x",
     "n",
@@ -102,6 +118,16 @@ def audit_env(mode: str, builder_path: Path = BUILDER_PATH) -> dict:
     env = os.environ.copy()
     env.pop("IDEA_DET_EIGSH_BACKEND", None)
     env.pop("IDEA_DET_PRIMME_MIN_DIM", None)
+    env.pop("IDEA_DET_DISABLE_PRIMME", None)
+    if mode == "current_fast_scipy":
+        env["IDEA_DET_EIGSH_BACKEND"] = "scipy"
+    elif mode == "current_fast_primme":
+        env["IDEA_DET_EIGSH_BACKEND"] = "primme"
+        # Threshold 0 so PRIMME is exercised on every dispatched solve,
+        # not just the cases above the default 2000-dimension cutoff.
+        env["IDEA_DET_PRIMME_MIN_DIM"] = "0"
+    elif mode == "current_no_primme":
+        env["IDEA_DET_DISABLE_PRIMME"] = "1"
     env["MPLCONFIGDIR"] = str(AUDIT_ROOT / "matplotlib-cache" / mode)
     env["XDG_CACHE_HOME"] = str(AUDIT_ROOT / "xdg-cache" / mode)
     env["PYTHONPATH"] = os.pathsep.join(import_paths_for_mode(mode, builder_path))
@@ -111,7 +137,7 @@ def audit_env(mode: str, builder_path: Path = BUILDER_PATH) -> dict:
 def import_paths_for_mode(mode: str, builder_path: Path = BUILDER_PATH) -> list[str]:
     if mode == "release":
         return [str(RELEASE_SITE), str(builder_path)]
-    if mode in ("current_compat", "current_fast"):
+    if mode == "current_compat" or mode in _CURRENT_FAST_MODES:
         return [str(REPO_ROOT), str(builder_path)]
     raise ValueError(f"Unknown audit mode: {mode}")
 
@@ -283,7 +309,11 @@ def solver_cases() -> list[str]:
 
 def modes_for_solver_case(case_name: str) -> tuple[str, ...]:
     if case_name == "interacting_det_harmonic_uud":
-        return ("current_fast",)
+        # No release counterpart (the legacy solver can't reliably
+        # produce uud at any speed). Run the dispatched path under
+        # every backend permutation so the variants cross-check each
+        # other implicitly via the audit report.
+        return _CURRENT_FAST_MODES
     if case_name.startswith("interacting_"):
         return MODES
     return ("release", "current_fast")
