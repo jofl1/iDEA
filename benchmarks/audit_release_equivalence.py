@@ -266,6 +266,17 @@ def solver_cases() -> list[str]:
         "reverse_ks_harmonic_uu",
         "interacting_harmonic_uu",
         "interacting_harmonic_ud",
+        # A3: non-canonical spin orderings (reconstruction depends on
+        # electron-axis order, not just counts).
+        "interacting_harmonic_du",
+        "interacting_harmonic_dud",
+        "interacting_harmonic_ddu",
+        # A7: representative non-default finite-difference stencils.
+        "interacting_harmonic_uu_stencil5",
+        "interacting_harmonic_uu_stencil11",
+        # A8: large-offset asymmetric potential — exercises the parity
+        # rtol fix end-to-end; must take the non-parity path.
+        "interacting_offset_asymmetric_uu",
         "interacting_det_harmonic_uud",
     ]
 
@@ -1012,7 +1023,13 @@ def worker_solver_payload(mode: str, case_name: str) -> dict:
             "ks_down_orbitals": state_ks.down.orbitals,
         }
 
-    if case_name in ("interacting_harmonic_uu", "interacting_harmonic_ud"):
+    if case_name in (
+        "interacting_harmonic_uu",
+        "interacting_harmonic_ud",
+        "interacting_harmonic_du",
+        "interacting_harmonic_dud",
+        "interacting_harmonic_ddu",
+    ):
         electrons = case_name.rsplit("_", 1)[-1]
         s = harmonic_system(n_points=32, electrons=electrons)
         kwargs = {}
@@ -1026,6 +1043,44 @@ def worker_solver_payload(mode: str, case_name: str) -> dict:
             "space": state.space,
             "spin": state.spin,
             "full": state.full,
+            "density": density,
+        }
+
+    if case_name.startswith("interacting_harmonic_uu_stencil"):
+        # A7: same harmonic problem, different finite-difference stencil.
+        stencil = int(case_name.rsplit("stencil", 1)[-1])
+        s = harmonic_system(n_points=32, electrons="uu")
+        s.stencil = stencil
+        kwargs = {}
+        if mode == "current_compat":
+            kwargs["bypass_det"] = True
+        state = iDEA.methods.interacting.solve(s, k=0, **kwargs)
+        density = iDEA.observables.density(s, state=state)
+        return {
+            "x": s.x,
+            "stencil": np.array(stencil),
+            "energy": np.array(state.energy),
+            "density": density,
+        }
+
+    if case_name == "interacting_offset_asymmetric_uu":
+        # A8: v_ext = harmonic + 1e6 offset + asymmetric kink. Must take
+        # the non-parity path (covers the rtol fix end-to-end).
+        n_points = 28
+        x = np.linspace(-6, 6, n_points)
+        v_ext = 0.5 * 0.25**2 * x**2 + 1e6
+        v_ext[n_points // 3] += 0.1  # asymmetric kink
+        v_int = iDEA.interactions.softened_interaction(x)
+        s = iDEA.system.System(x, v_ext, v_int, electrons="uu")
+        kwargs = {}
+        if mode == "current_compat":
+            kwargs["bypass_det"] = True
+        state = iDEA.methods.interacting.solve(s, k=0, **kwargs)
+        density = iDEA.observables.density(s, state=state)
+        return {
+            "x": s.x,
+            "v_ext": s.v_ext,
+            "energy": np.array(state.energy),
             "density": density,
         }
 
