@@ -382,3 +382,43 @@ def test_labelled_reconstruction_preserves_det_attributes(case_name):
         s, state=labelled
     )
     assert np.allclose(n_via_det, n_via_obs, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("electrons", ["uu", "ud", "uud"])
+def test_backend_equivalence(electrons, monkeypatch):
+    """Energy and density should match across scipy and PRIMME backends.
+
+    Phase E1 gate: PRIMME is a drop-in replacement at this commit. No
+    preconditioner, no warm start, just the library swap. If PRIMME is
+    not installed, the test still runs but reports only scipy.
+    """
+    primme_available = True
+    try:
+        import primme  # noqa: F401
+    except ImportError:
+        primme_available = False
+
+    # Small case so the test runs fast across both backends. Force the
+    # primme branch regardless of the size threshold so we actually
+    # exercise both code paths.
+    n_grid = 18
+    x = np.linspace(-6, 6, n_grid)
+    v_ext = 0.5 * 0.25**2 * x**2
+    v_int = iDEA.interactions.softened_interaction(x)
+    s = iDEA.system.System(x, v_ext, v_int, electrons=electrons)
+
+    monkeypatch.setenv("IDEA_DET_PRIMME_MIN_DIM", "0")
+
+    monkeypatch.setenv("IDEA_DET_EIGSH_BACKEND", "scipy")
+    state_scipy = det.solve(s, k=0)
+    n_scipy = det.density(s, state_scipy)
+
+    if not primme_available:
+        pytest.skip("primme not installed; skipping cross-backend comparison")
+
+    monkeypatch.setenv("IDEA_DET_EIGSH_BACKEND", "primme")
+    state_primme = det.solve(s, k=0)
+    n_primme = det.density(s, state_primme)
+
+    assert np.isclose(state_scipy.energy, state_primme.energy, rtol=1e-10, atol=1e-12)
+    assert np.allclose(n_scipy, n_primme, rtol=1e-10, atol=1e-12)

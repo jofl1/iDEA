@@ -21,6 +21,7 @@ Public API (Phase B scope: energy and density only):
 """
 
 import itertools
+import os
 
 import numpy as np
 import scipy.sparse as sps
@@ -30,8 +31,101 @@ import iDEA.methods.non_interacting
 import iDEA.state
 import iDEA.system
 
+try:
+    import primme
+
+    _HAS_PRIMME = True
+except ImportError:
+    _HAS_PRIMME = False
+
 
 name = "interacting_det"
+
+
+def _get_primme_min_dim() -> int:
+    """Dimension below which we fall back to scipy regardless of PRIMME.
+
+    PRIMME's Jacobi-Davidson defaults have higher per-iteration overhead
+    than ARPACK Lanczos for tiny problems. Default 2000, override via
+    environment variable ``IDEA_DET_PRIMME_MIN_DIM``.
+    """
+    return int(os.environ.get("IDEA_DET_PRIMME_MIN_DIM", "2000"))
+
+
+def _resolve_backend(D: int, explicit: str = None) -> str:
+    """Pick eigensolver backend. Precedence: explicit > env > auto."""
+    if explicit is not None:
+        return explicit
+    env = os.environ.get("IDEA_DET_EIGSH_BACKEND")
+    if env:
+        return env
+    if _HAS_PRIMME and D >= _get_primme_min_dim():
+        return "primme"
+    return "scipy"
+
+
+def _solve_with_preconditioner(
+    op,
+    k: int = 1,
+    tol: float = 0.0,
+    diag_for_prec: np.ndarray = None,
+    v0: np.ndarray = None,
+    backend: str = None,
+):
+    """Smallest-algebraic eigenpair solve via PRIMME or scipy.
+
+    Both ``_solve_in_parity_block`` and the full-basis fallback in
+    ``solve`` route through this helper so backend selection,
+    preconditioner construction (Phase E2), and warm-start v0
+    plumbing (Phase E3) live in one place.
+
+    | Args:
+    |     op: scipy ``LinearOperator`` (sparse matrix also works).
+    |     k: number of eigenpairs to return.
+    |     tol: solver tolerance. ``0`` means scipy machine precision;
+    |         remapped to ``1e-12`` for PRIMME (whose ``tol=0`` means
+    |         the library's looser default).
+    |     diag_for_prec: full-basis diagonal of ``op`` for the Jacobi
+    |         preconditioner. Used by Phase E2 (PRIMME only); ignored
+    |         in Phase E1 even if supplied.
+    |     v0: initial guess for the eigensolve (Phase E3).
+    |     backend: explicit override; ``"primme"`` or ``"scipy"``. If
+    |         ``None``, resolves via env var ``IDEA_DET_EIGSH_BACKEND``
+    |         then auto-selects (PRIMME if installed and ``op.shape[0]
+    |         >= IDEA_DET_PRIMME_MIN_DIM``, else scipy).
+
+    | Returns:
+    |     ``(energies, eigvecs)`` with energies ascending and
+    |     ``eigvecs.shape == (D, k)``, matching scipy's column-major
+    |     convention.
+    """
+    D = op.shape[0]
+    resolved = _resolve_backend(D, backend)
+
+    if resolved == "primme":
+        # PRIMME's tol=0 falls back to its loose default (sqrt of machine
+        # epsilon, ~1.5e-8). Our existing scipy call sites use tol=0 to
+        # mean machine precision; map to a tighter value so PRIMME
+        # doesn't silently relax the convergence criterion. Some
+        # upstream tests (test_manybody.py::TestShort) compare against
+        # analytical wavefunctions at the 1e-7 to 1e-11 level; eps is
+        # too tight for PRIMME's unpreconditioned Lanczos on larger
+        # problems (fails to converge within maxiter on uudd_30).
+        # 1e-13 is the empirically validated sweet spot.
+        primme_tol = tol if tol > 0 else 1e-13
+        v0_arg = v0.reshape(-1, 1) if v0 is not None else None
+        # Phase E2 will construct a Jacobi preconditioner from
+        # diag_for_prec here. Phase E1 leaves it unused.
+        prec_op = None
+        energies, eigvecs = primme.eigsh(
+            op, k=k, which="SA", tol=primme_tol, v0=v0_arg, OPinv=prec_op,
+            raise_for_unconverged=True,
+        )
+    else:
+        energies, eigvecs = spsla.eigsh(op, k=k, which="SA", tol=tol)
+
+    order = np.argsort(energies)
+    return energies[order], eigvecs[:, order]
 
 
 def _build_basis(n_grid: int, n_per_spin: int):
@@ -404,10 +498,7 @@ def _solve_in_parity_block(comps, Q_p, k=0, tol=0.0):
     op_block = spsla.LinearOperator(
         shape=(D_block, D_block), matvec=matvec_block, dtype=float
     )
-    energies, eigvecs = spsla.eigsh(op_block, k=n_eig, which="SA", tol=tol)
-    order = np.argsort(energies)
-    energies = energies[order]
-    eigvecs = eigvecs[:, order]
+    energies, eigvecs = _solve_with_preconditioner(op_block, k=n_eig, tol=tol)
     eigvecs_full = Q_p @ eigvecs
     return energies, eigvecs_full
 
@@ -508,10 +599,9 @@ def solve(
             eigvecs = eigvecs[:, :n_eig]
             energies = energies[:n_eig]
         else:
-            energies, eigvecs = spsla.eigsh(comps.op, k=n_eig, which="SA", tol=tol)
-            order = np.argsort(energies)
-            energies = energies[order]
-            eigvecs = eigvecs[:, order]
+            energies, eigvecs = _solve_with_preconditioner(
+                comps.op, k=n_eig, tol=tol
+            )
         eigval = float(energies[k])
         amplitudes = eigvecs[:, k].reshape(D_up, D_down)
         selected_parity = 0  # parity unknown / not applicable

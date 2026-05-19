@@ -28,10 +28,15 @@ from pathlib import Path
 
 import numpy as np
 
+# Allow `from counting_operator import ...` when the script is run from the
+# repo root via ``python benchmarks/benchmark_interacting.py``.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import iDEA
 import iDEA.methods.interacting
 import iDEA.methods.interacting_det
 import iDEA.observables
+from counting_operator import CountingLinearOperator
 
 
 DEFAULT_BASELINE_DIR = Path("benchmarks/interacting_baseline")
@@ -116,16 +121,54 @@ def build_baseline_payload(s, energy, density):
     }
 
 
-def time_cases(case_names, runs, solver="labelled"):
+@contextlib.contextmanager
+def _count_det_matvecs(counter):
+    """Monkey-patch interacting_det._solve_with_preconditioner to wrap the
+    operator in a CountingLinearOperator. Restores on exit.
+
+    Only meaningful for ``--solver det`` (labelled solver doesn't go
+    through the helper). Counter is a single-element list so the
+    contextmanager can mutate it from the closure.
+    """
+    import iDEA.methods.interacting_det as _det
+
+    original = _det._solve_with_preconditioner
+
+    def counting_helper(op, k=1, tol=0.0, diag_for_prec=None, v0=None, backend=None):
+        counting_op = CountingLinearOperator(
+            op.matvec, shape=op.shape, dtype=op.dtype
+        )
+        en, ev = original(
+            counting_op, k=k, tol=tol,
+            diag_for_prec=diag_for_prec, v0=v0, backend=backend,
+        )
+        counter[0] += counting_op.count
+        return en, ev
+
+    _det._solve_with_preconditioner = counting_helper
+    try:
+        yield
+    finally:
+        _det._solve_with_preconditioner = original
+
+
+def time_cases(case_names, runs, solver="labelled", count_matvecs=False):
     for name in case_names:
         print(f"\n{name} (solver={solver})")
         s = CASES[name]()
         times = []
+        matvec_counts = []
         last_energy = None
         last_density = None
         for _ in range(runs):
-            elapsed, energy, density = solve_and_measure(s, solver=solver)
+            counter = [0]
+            if count_matvecs and solver == "det":
+                with _count_det_matvecs(counter):
+                    elapsed, energy, density = solve_and_measure(s, solver=solver)
+            else:
+                elapsed, energy, density = solve_and_measure(s, solver=solver)
             times.append(elapsed)
+            matvec_counts.append(counter[0])
             last_energy = energy
             last_density = density
         median = statistics.median(times)
@@ -134,6 +177,14 @@ def time_cases(case_names, runs, solver="labelled"):
             f"({runs} runs, min={min(times):.3f}s max={max(times):.3f}s)"
         )
         print(f"  peak memory:      {peak_memory_mb():.1f} MB (process cumulative)")
+        if count_matvecs:
+            if solver == "det":
+                print(
+                    f"  matvec count:     median={statistics.median(matvec_counts)} "
+                    f"(min={min(matvec_counts)} max={max(matvec_counts)})"
+                )
+            else:
+                print("  matvec count:     n/a (labelled solver not instrumented)")
         print(f"  energy:           {last_energy:.10f}")
         print(
             f"  density integral: {float(np.sum(last_density) * s.dx):.6f} "
@@ -200,6 +251,11 @@ def main(argv=None):
     time_parser.add_argument("--runs", type=int, default=3)
     time_parser.add_argument("--case", choices=sorted(CASES), action="append")
     time_parser.add_argument("--solver", choices=SOLVERS, default="labelled")
+    time_parser.add_argument(
+        "--count-matvecs",
+        action="store_true",
+        help="Report the median matvec count per case (det solver only).",
+    )
 
     gen_parser = subparsers.add_parser("generate")
     gen_parser.add_argument("--baseline-dir", default=str(DEFAULT_BASELINE_DIR))
@@ -222,7 +278,12 @@ def main(argv=None):
     case_names = args.case or sorted(CASES)
 
     if args.command == "time":
-        time_cases(case_names, runs=args.runs, solver=args.solver)
+        time_cases(
+            case_names,
+            runs=args.runs,
+            solver=args.solver,
+            count_matvecs=args.count_matvecs,
+        )
         return 0
     if args.command == "generate":
         generate_baselines(case_names, args.baseline_dir, solver=args.solver)

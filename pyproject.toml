@@ -38,6 +38,9 @@ dev = [
     "sphinx-rtd-theme>=1.0.0",
     "twine>=4.0.0",
 ]
+fast = [
+    "primme>=3.2.0",
+]
 
 [project.urls]
 "Home page" = "https://idea-org.github.io/"
