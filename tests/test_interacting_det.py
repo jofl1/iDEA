@@ -27,6 +27,7 @@ import iDEA.interactions
 import iDEA.methods.interacting
 import iDEA.methods.interacting_det as det
 import iDEA.methods.non_interacting
+import iDEA.observables
 import iDEA.system
 
 
@@ -314,6 +315,38 @@ def test_parity_symmetry_check_accepts_pristine_symmetric():
 
     assert det._v_ext_is_parity_symmetric(s)
     assert det._v_int_is_parity_symmetric(s)
+
+
+def test_state_roundtrips_through_deepcopy_and_pickle():
+    """ManyBodyState produced by the dispatched fast path must survive a
+    ``copy.deepcopy`` and ``pickle`` round-trip with all observables
+    intact. Catches unpicklable attributes (cached lambdas, opaque
+    handles) silently attached during reconstruction.
+    """
+    import copy as _copy
+    import pickle
+
+    x = np.linspace(-6, 6, 24)
+    v_ext = 0.5 * 0.25**2 * x**2
+    v_int = iDEA.interactions.softened_interaction(x)
+    s = iDEA.system.System(x, v_ext, v_int, electrons="ud")
+
+    state = iDEA.methods.interacting.solve(s, k=0)
+    n_orig = iDEA.observables.density(s, state=state)
+
+    deep = _copy.deepcopy(state)
+    n_deep = iDEA.observables.density(s, state=deep)
+    assert np.array_equal(n_orig, n_deep), "deepcopy density mismatch"
+    assert float(deep.energy) == float(state.energy)
+
+    pickled = pickle.dumps(state)
+    restored = pickle.loads(pickled)
+    n_pickled = iDEA.observables.density(s, state=restored)
+    assert np.array_equal(n_orig, n_pickled), "pickle round-trip density mismatch"
+    assert float(restored.energy) == float(state.energy)
+    # Sparse indicator matrices (det_up_indicator / det_down_indicator) and
+    # numpy arrays attached by build_labelled_state must round-trip too.
+    assert np.array_equal(restored.det_amplitudes, state.det_amplitudes)
 
 
 def test_solve_falls_back_to_full_basis_on_asymmetric_offset():
