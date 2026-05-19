@@ -231,16 +231,10 @@ def sc_step(
     | Returns:
     |     state: iDEA.state.SingleBodyState, New state.
     """
-    # Solve the non-interacting Schrodinger equation. Compute only the lowest
-    # max(up_count, down_count) + k eigenpairs needed by add_occupations and
-    # the density observables; fall back to full eigh for degenerate edge cases.
-    max_level = max(s.up_count, s.down_count) + k
-    if 1 <= max_level < up_H.shape[0]:
-        state.up.energies, state.up.orbitals = spla.eigh(up_H, subset_by_index=(0, max_level - 1))
-        state.down.energies, state.down.orbitals = spla.eigh(down_H, subset_by_index=(0, max_level - 1))
-    else:
-        state.up.energies, state.up.orbitals = spla.eigh(up_H)
-        state.down.energies, state.down.orbitals = spla.eigh(down_H)
+    # Public solve returns the full single-particle spectrum, matching the
+    # release contract for state energy/orbital/occupation array shapes.
+    state.up.energies, state.up.orbitals = spla.eigh(up_H)
+    state.down.energies, state.down.orbitals = spla.eigh(down_H)
 
     # Normalise orbitals.
     state.up.orbitals = state.up.orbitals / np.sqrt(s.dx)
