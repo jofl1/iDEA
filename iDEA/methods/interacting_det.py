@@ -366,6 +366,40 @@ def _build_indicator(combs, n_grid):
     return sps.csr_matrix((data, (rows, cols)), shape=(D, n_grid))
 
 
+class _InvariantComponents:
+    """Sweep-invariant precomputed structures shared by all solves on a
+    fixed (x, dx, electrons, stencil) system.
+
+    These structures depend ONLY on the grid geometry, the electron
+    counts, and the finite-difference stencil — NOT on v_ext or v_int.
+    A SolveContext that iterates over a sweep (varying v_ext, fixed
+    everything else) can build this once and reuse it for every solve.
+
+    Phase S3.1a factoring step: the previous monolithic
+    ``_build_solver_components`` is now ``_build_invariant_components``
+    plus ``_build_op_for_potential``. The composer that produces the
+    full ``_SolverComponents`` lives below.
+    """
+
+    __slots__ = (
+        "up_combs",
+        "down_combs",
+        "up_rank",
+        "down_rank",
+        "up_hops",
+        "down_hops",
+        "up_indicator",
+        "down_indicator",
+        "D",
+        "D_up",
+        "D_down",
+        "h_diag",
+        "n_grid",
+        "n_up",
+        "n_down",
+    )
+
+
 class _SolverComponents:
     """Precomputed structures shared between solve() and validation tests.
 
@@ -394,7 +428,12 @@ class _SolverComponents:
     )
 
 
-def _build_solver_components(s: iDEA.system.System) -> _SolverComponents:
+def _build_invariant_components(s: iDEA.system.System) -> _InvariantComponents:
+    """Build the sweep-invariant components of the solver.
+
+    Depends only on ``(s.x, s.dx, s.electrons, s.stencil)``. Reused
+    across every solve in a sweep by ``SolveContext``.
+    """
     n_grid = s.x.shape[0]
     n_up = s.up_count
     n_down = s.down_count
@@ -410,7 +449,42 @@ def _build_solver_components(s: iDEA.system.System) -> _SolverComponents:
 
     up_hops = _build_one_body_hops(up_combs, up_rank, K, n_grid)
     down_hops = _build_one_body_hops(down_combs, down_rank, K, n_grid)
-    diag = _build_diagonal(up_combs, down_combs, s.v_ext, s.v_int, h_diag)
+
+    inv = _InvariantComponents()
+    inv.up_combs = up_combs
+    inv.down_combs = down_combs
+    inv.up_rank = up_rank
+    inv.down_rank = down_rank
+    inv.up_hops = up_hops
+    inv.down_hops = down_hops
+    inv.up_indicator = _build_indicator(up_combs, n_grid)
+    inv.down_indicator = _build_indicator(down_combs, n_grid)
+    inv.D = D
+    inv.D_up = D_up
+    inv.D_down = D_down
+    inv.h_diag = h_diag
+    inv.n_grid = n_grid
+    inv.n_up = n_up
+    inv.n_down = n_down
+    return inv
+
+
+def _build_op_for_potential(inv: _InvariantComponents, v_ext, v_int):
+    """Build the per-potential pieces (diagonal, matvec, LinearOperator).
+
+    Reuses the invariant ``inv.up_hops``, ``inv.down_hops``,
+    ``inv.h_diag`` and rebuilds only what changes when ``v_ext`` or
+    ``v_int`` change. Returns ``(diag, matvec, op)`` so the caller can
+    cache the diagonal, attach it to a ``_SolverComponents``, or
+    feed it into a Jacobi preconditioner.
+    """
+    D = inv.D
+    D_up = inv.D_up
+    D_down = inv.D_down
+    up_hops = inv.up_hops
+    down_hops = inv.down_hops
+
+    diag = _build_diagonal(inv.up_combs, inv.down_combs, v_ext, v_int, inv.h_diag)
 
     up_has_hops = up_hops.nnz > 0
     down_has_hops = down_hops.nnz > 0
@@ -425,22 +499,28 @@ def _build_solver_components(s: iDEA.system.System) -> _SolverComponents:
         return out.ravel()
 
     op = spsla.LinearOperator(shape=(D, D), matvec=matvec, dtype=float)
+    return diag, matvec, op
+
+
+def _build_solver_components(s: iDEA.system.System) -> _SolverComponents:
+    inv = _build_invariant_components(s)
+    diag, matvec, op = _build_op_for_potential(inv, s.v_ext, s.v_int)
 
     comps = _SolverComponents()
     comps.op = op
     comps.matvec = matvec
-    comps.D = D
-    comps.D_up = D_up
-    comps.D_down = D_down
-    comps.up_combs = up_combs
-    comps.down_combs = down_combs
-    comps.up_rank = up_rank
-    comps.down_rank = down_rank
-    comps.up_indicator = _build_indicator(up_combs, n_grid)
-    comps.down_indicator = _build_indicator(down_combs, n_grid)
+    comps.D = inv.D
+    comps.D_up = inv.D_up
+    comps.D_down = inv.D_down
+    comps.up_combs = inv.up_combs
+    comps.down_combs = inv.down_combs
+    comps.up_rank = inv.up_rank
+    comps.down_rank = inv.down_rank
+    comps.up_indicator = inv.up_indicator
+    comps.down_indicator = inv.down_indicator
     comps.diag = diag
-    comps.up_hops = up_hops
-    comps.down_hops = down_hops
+    comps.up_hops = inv.up_hops
+    comps.down_hops = inv.down_hops
     return comps
 
 
