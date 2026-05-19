@@ -303,6 +303,10 @@ def solver_cases() -> list[str]:
         # A8: large-offset asymmetric potential — exercises the parity
         # rtol fix end-to-end; must take the non-parity path.
         "interacting_offset_asymmetric_uu",
+        # A9: propagation from a fast-path initial state. propagate is
+        # still labelled but consumes state.space; this exercises the
+        # reconstruction at the time-evolution boundary.
+        "interacting_propagate_harmonic_uu_kick",
         "interacting_det_harmonic_uud",
     ]
 
@@ -1131,6 +1135,34 @@ def worker_solver_payload(mode: str, case_name: str) -> dict:
             "stencil": np.array(stencil),
             "energy": np.array(state.energy),
             "density": density,
+        }
+
+    if case_name == "interacting_propagate_harmonic_uu_kick":
+        # A9: propagation from a fast-path initial state. Solve the
+        # ground state under the dispatch (per mode) then evolve a
+        # handful of timesteps under a linear kick perturbation.
+        # propagate itself stays labelled; this case pins that the
+        # reconstructed state.space hands off to the labelled
+        # propagator without contract drift.
+        n_points = 18
+        s = harmonic_system(n_points=n_points, electrons="uu")
+        kwargs = {}
+        if mode == "current_compat":
+            kwargs["bypass_det"] = True
+        state = iDEA.methods.interacting.solve(s, k=0, **kwargs)
+        n_steps = 5
+        t = np.linspace(0.0, 0.05, n_steps)
+        # Linear-kick perturbation, broadcast to (T, N).
+        v_ptrb = np.broadcast_to(0.02 * s.x, (n_steps, n_points)).copy()
+        evolution = iDEA.methods.interacting.propagate(s, state, v_ptrb, t)
+        td_density = iDEA.observables.density(s, evolution=evolution)
+        return {
+            "x": s.x,
+            "t": t,
+            "v_ptrb": v_ptrb,
+            "initial_energy": np.array(state.energy),
+            "td_density": td_density,
+            "td_space_abs": np.abs(evolution.td_space),
         }
 
     if case_name == "interacting_offset_asymmetric_uu":

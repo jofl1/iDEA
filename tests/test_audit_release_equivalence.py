@@ -202,6 +202,35 @@ def test_stencil_variant_worker_payload_agrees_across_modes():
         assert np.allclose(fast["density"], compat["density"], atol=1e-12, rtol=0)
 
 
+def test_propagation_case_is_registered():
+    audit = _load_audit_module()
+    assert "interacting_propagate_harmonic_uu_kick" in audit.solver_cases()
+
+
+def test_propagation_worker_payload_agrees_across_modes():
+    """A9: propagation from a fast-path initial state must produce
+    matching time-dependent density against the legacy labelled solve
+    + propagate. Catches reconstruction-at-the-time-evolution-boundary
+    bugs even though propagate itself is labelled.
+    """
+    audit = _load_audit_module()
+    fast = audit.worker_solver_payload(
+        "current_fast", "interacting_propagate_harmonic_uu_kick"
+    )
+    compat = audit.worker_solver_payload(
+        "current_compat", "interacting_propagate_harmonic_uu_kick"
+    )
+    assert fast["td_density"].shape == compat["td_density"].shape
+    assert np.allclose(
+        fast["td_density"], compat["td_density"], atol=1e-10, rtol=0.0
+    )
+    assert np.isclose(
+        float(fast["initial_energy"]),
+        float(compat["initial_energy"]),
+        atol=1e-12,
+    )
+
+
 def test_asymmetric_offset_worker_payload_takes_non_parity_path():
     """A8: large-offset asymmetric potential. Without the A1 rtol fix,
     parity could be mis-detected and one block solved on a Hamiltonian
