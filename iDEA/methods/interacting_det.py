@@ -128,6 +128,55 @@ def _solve_with_preconditioner(
     return energies[order], eigvecs[:, order]
 
 
+def _slater_amplitudes(phi_occ: np.ndarray, combs):
+    """Slater-determinant minors of ``phi_occ`` at grid sites in ``combs``.
+
+    For an M-orbital channel with M = N_sigma electrons, the amplitude
+    for grid-combination tuple I is
+
+        amp_I = det( phi_occ[ list(I), : ] ),
+
+    i.e. the determinant of the M×M submatrix of the orbital coefficient
+    matrix at the grid sites listed in I. Returned as a length-D array.
+
+    For the vacuum channel (M = N_sigma = 0) the single basis state has
+    amplitude 1. Implementation builds the ``(D, M, M)`` stacked
+    submatrix tensor and dispatches to ``np.linalg.det``'s batched
+    routine — Python-loop ``np.linalg.det`` per comb is too slow for
+    larger cases.
+    """
+    if not combs or not combs[0]:
+        return np.ones(len(combs), dtype=float)
+    indices = np.array(combs, dtype=np.intp)  # (D, M)
+    sub_matrices = phi_occ[indices, :]  # (D, M, M)
+    return np.linalg.det(sub_matrices)
+
+
+def _noninteracting_slater_det(
+    s: "iDEA.system.System", up_combs, down_combs
+) -> np.ndarray:
+    """Non-interacting ground-state Slater determinant in grid-det basis.
+
+    Solves the single-particle Hamiltonian ``K + diag(v_ext)`` (no
+    Hartree, no exchange), picks the lowest ``N_up`` orbitals for the
+    up channel and the lowest ``N_down`` for down, and expands the
+    product Slater determinant as Slater minors per channel.
+
+    Returns a ``(D_up, D_down)`` amplitude array, Euclidean-normalised.
+    Used as the cold-start ``v0`` for the PRIMME eigensolve.
+    """
+    K = iDEA.methods.non_interacting.kinetic_energy_operator(s)
+    H_sp = K + np.diag(s.v_ext)
+    _energies, phi = np.linalg.eigh(H_sp)
+    up_amps = _slater_amplitudes(phi[:, : s.up_count], up_combs)
+    down_amps = _slater_amplitudes(phi[:, : s.down_count], down_combs)
+    amps = up_amps[:, None] * down_amps[None, :]
+    nrm = float(np.linalg.norm(amps))
+    if nrm > 0:
+        amps = amps / nrm
+    return amps
+
+
 def _build_basis(n_grid: int, n_per_spin: int):
     """Sorted-tuple combinations and rank map for one spin channel.
 
@@ -471,7 +520,24 @@ def _build_parity_projection(reps, partner, self_mask, s_ref, p, D):
     return sps.csr_matrix((data, (rows, cols)), shape=(D, len(reps)), dtype=float)
 
 
-def _solve_in_parity_block(comps, Q_p, k=0, tol=0.0):
+def _project_to_block(v_full, Q_p):
+    """Project a full-basis vector into a parity-block, Euclidean-normalised.
+
+    Returns ``None`` if ``v_full is None`` (no v0 to project), or if the
+    projection norm is essentially zero (the input has the opposite
+    parity from the block). The eigensolver then falls back to its
+    default starting vector.
+    """
+    if v_full is None:
+        return None
+    v_block = Q_p.T @ v_full
+    nrm = float(np.linalg.norm(v_block))
+    if nrm <= 1e-12:
+        return None
+    return v_block / nrm
+
+
+def _solve_in_parity_block(comps, Q_p, k=0, tol=0.0, v0=None):
     """Run eigsh on Q_p^T H Q_p (the friend's 'implicit projector' form).
 
     Returns (energies[: k+1], eigvecs in full basis[:, : k+1]).
@@ -498,7 +564,9 @@ def _solve_in_parity_block(comps, Q_p, k=0, tol=0.0):
     op_block = spsla.LinearOperator(
         shape=(D_block, D_block), matvec=matvec_block, dtype=float
     )
-    energies, eigvecs = _solve_with_preconditioner(op_block, k=n_eig, tol=tol)
+    energies, eigvecs = _solve_with_preconditioner(
+        op_block, k=n_eig, tol=tol, v0=v0
+    )
     eigvecs_full = Q_p @ eigvecs
     return energies, eigvecs_full
 
@@ -545,6 +613,26 @@ def solve(
         and _v_int_is_parity_symmetric(s)
     )
 
+    # Cold-start v0: non-interacting Slater determinant in the
+    # grid-determinant basis. Used as the PRIMME initial guess so the
+    # solver doesn't have to find the ground-state subspace from a
+    # random vector. Skip the construction when scipy will handle every
+    # branch (PRIMME absent or operator dim below the threshold) since
+    # scipy.eigsh doesn't accept v0 in this code path and the
+    # Slater-determinant minors are wasted work.
+    expected_solve_dim = (D // 2) if can_use_parity else D
+    primme_min = _get_primme_min_dim()
+    will_use_primme = _HAS_PRIMME and (
+        os.environ.get("IDEA_DET_EIGSH_BACKEND") == "primme"
+        or expected_solve_dim >= primme_min
+    )
+    if will_use_primme:
+        v0_full = _noninteracting_slater_det(
+            s, comps.up_combs, comps.down_combs
+        ).ravel()
+    else:
+        v0_full = None
+
     if can_use_parity:
         n_grid = s.x.shape[0]
         n_up = s.up_count
@@ -560,15 +648,24 @@ def solve(
             predicted = _predict_ground_parity(s)
             reps = reps_pos if predicted == +1 else reps_neg
             Q_p = _build_parity_projection(reps, partner, self_mask, s_ref, predicted, D)
-            energies_p, eigvecs_p = _solve_in_parity_block(comps, Q_p, k=0, tol=tol)
+            v0_block = _project_to_block(v0_full, Q_p)
+            energies_p, eigvecs_p = _solve_in_parity_block(
+                comps, Q_p, k=0, tol=tol, v0=v0_block,
+            )
             eigval = float(energies_p[0])
             amplitudes = eigvecs_p[:, 0].reshape(D_up, D_down)
             selected_parity = predicted
         else:
             Q_pos = _build_parity_projection(reps_pos, partner, self_mask, s_ref, +1, D)
             Q_neg = _build_parity_projection(reps_neg, partner, self_mask, s_ref, -1, D)
-            energies_pos, eigvecs_pos = _solve_in_parity_block(comps, Q_pos, k=k, tol=tol)
-            energies_neg, eigvecs_neg = _solve_in_parity_block(comps, Q_neg, k=k, tol=tol)
+            v0_pos = _project_to_block(v0_full, Q_pos)
+            v0_neg = _project_to_block(v0_full, Q_neg)
+            energies_pos, eigvecs_pos = _solve_in_parity_block(
+                comps, Q_pos, k=k, tol=tol, v0=v0_pos,
+            )
+            energies_neg, eigvecs_neg = _solve_in_parity_block(
+                comps, Q_neg, k=k, tol=tol, v0=v0_neg,
+            )
             all_energies = np.concatenate([energies_pos, energies_neg])
             all_eigvecs = np.concatenate([eigvecs_pos, eigvecs_neg], axis=1)
             parities = np.concatenate(
@@ -600,7 +697,7 @@ def solve(
             energies = energies[:n_eig]
         else:
             energies, eigvecs = _solve_with_preconditioner(
-                comps.op, k=n_eig, tol=tol
+                comps.op, k=n_eig, tol=tol, v0=v0_full,
             )
         eigval = float(energies[k])
         amplitudes = eigvecs[:, k].reshape(D_up, D_down)

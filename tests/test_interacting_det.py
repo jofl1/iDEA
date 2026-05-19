@@ -26,6 +26,7 @@ import iDEA
 import iDEA.interactions
 import iDEA.methods.interacting
 import iDEA.methods.interacting_det as det
+import iDEA.methods.non_interacting
 import iDEA.system
 
 
@@ -382,6 +383,40 @@ def test_labelled_reconstruction_preserves_det_attributes(case_name):
         s, state=labelled
     )
     assert np.allclose(n_via_det, n_via_obs, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("electrons", ["uu", "ud", "uud"])
+def test_cold_start_slater_determinant_is_exact_non_interacting(electrons):
+    """For v_int = 0, the non-interacting Slater determinant in the
+    grid-det basis should be an exact eigenvector of the matrix-free
+    operator with energy equal to the sum of the lowest-N
+    single-particle eigenvalues. Sanity check on the v0 builder.
+    """
+    n_grid = 25
+    x = np.linspace(-6, 6, n_grid)
+    v_ext = 0.5 * 0.25**2 * x**2
+    v_int = np.zeros((n_grid, n_grid))  # non-interacting
+    s = iDEA.system.System(x, v_ext, v_int, electrons=electrons)
+
+    # Build the non-interacting Slater determinant in det basis.
+    comps = det._build_solver_components(s)
+    amps = det._noninteracting_slater_det(s, comps.up_combs, comps.down_combs)
+
+    # Apply H via the matrix-free matvec and compute Rayleigh quotient.
+    v = amps.ravel()
+    Hv = comps.matvec(v)
+    energy_via_v0 = float(v @ Hv)
+
+    # Reference: sum of lowest-N_sigma single-particle eigenvalues per spin.
+    K = iDEA.methods.non_interacting.kinetic_energy_operator(s)
+    H_sp = K + np.diag(s.v_ext)
+    sp_energies, _ = np.linalg.eigh(H_sp)
+    expected = float(np.sum(sp_energies[: s.up_count]) + np.sum(sp_energies[: s.down_count]))
+
+    assert np.isclose(energy_via_v0, expected, rtol=1e-10, atol=1e-12), (
+        f"Slater v0 Rayleigh quotient {energy_via_v0:.10f} should match "
+        f"non-interacting reference {expected:.10f}"
+    )
 
 
 @pytest.mark.parametrize("electrons", ["uu", "ud", "uud"])
