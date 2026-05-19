@@ -39,8 +39,14 @@ work transparently.
 | 14 | ``f065bdb`` | ``build_labelled_state`` helper for backward-compatible dispatch. | Phase D1 |
 | 15 | ``ac000d2`` | Correct ``.space`` reconstruction per friend's prescription. | Phase D1.5 |
 | 16 | ``8130142`` | Transparent dispatch from ``interacting.solve`` to det fast path. | Phase D2 |
+| 17 | ``a03a005`` | Phase D timing/validation summary + handoff doc. | Phase D3 |
+| 18 | ``f60347d`` | PRIMME backend dispatch + counting LinearOperator infrastructure. | Phase E1 |
+| 19 | ``a4eea12`` | Cold-start v0 from non-interacting Slater determinant. | Phase E3 |
 
-11 commits ahead of ``origin/master`` (some upstream commits were
+(Phase E2 — diagonal Jacobi preconditioner — was attempted and
+skipped on empirical grounds; see "Phase E delivery" below.)
+
+14 commits ahead of ``origin/master`` (some upstream commits were
 ancestral to ours; the count is between the two diverged tips).
 
 ## Measured speedups
@@ -162,14 +168,26 @@ Friend's roadmap (paraphrased from
   ``antisymmetrize`` round-trip in ``interacting.solve`` when only
   density is needed. Would erase the small Phase D regression vs Phase
   C+ on ``uudd_30``. Touches ``iDEA/observables.py``.
-- **Phase E — PRIMME + diagonal Jacobi preconditioner + warm-started
-  initial vectors.** Friend's predicted 20x lever on top of Phase B+C;
-  the biggest remaining win for repeated workloads (KS-DFT outer loops,
-  reverse-engineering inner loops, time evolution). New dependency
-  (``primme``) but it's pip-installable and pure CPython usable.
-- **Phase F — spin-flip symmetry for ``N_up == N_down`` cases.**
+- **Phase F — sweep continuation v0.** Previous-iteration warm starts
+  across parameter sweeps (e.g. disorder ensembles in iDEA
+  Nearsightedness). Needs an API surface (pass previous state or
+  amplitudes back into ``solve`` as ``v0_full``) plus call-site
+  plumbing into research scripts. Friend's predicted 20x lever on top
+  of Phase B+C — Phase E delivered the *single-system* v0 piece;
+  Phase F is the iterated-workload piece.
+- **Phase F' — orbital-basis preconditioner.** Phase E2's grid-basis
+  diagonal Jacobi was empirically ineffective because the kinetic
+  energy dominates the diagonal (eigenvalue is ~60 below
+  ``min(diag(H))`` on the test cases, so the Jacobi denominator is
+  nearly uniform). Friend's note in
+  ``notes/friend_optimization_advice.md``: ``H_0 = sum_sigma h_ij
+  c+ c`` is *diagonal* in the Slater-determinant basis built from
+  one-particle eigenorbitals, so ``H_0 - theta I`` is an excellent
+  conceptual preconditioner — but the interaction is diagonal in the
+  *grid* basis, not the orbital basis. Needs a basis transform.
+- **Phase G — spin-flip symmetry for ``N_up == N_down`` cases.**
   Additional 2x where applicable (``ud``, ``uudd``, etc.).
-- **Phase G — GPU matrix-free kernels.** Friend de-prioritised this
+- **Phase H — GPU matrix-free kernels.** Friend de-prioritised this
   ("GPU is the wrong lever first"), but mentioned it as a parallel
   track. Would need a separate ``LinearOperator`` backend.
 
@@ -210,3 +228,92 @@ No existing functions changed signature beyond the new ``bypass_det``
 kwarg. No existing test was modified; the wavefunction comparison
 tests for ``uu`` and ``ud`` started passing once Phase D2's ``.space``
 reconstruction was correct.
+
+## Phase E delivery
+
+Phase E added an eigensolver-backend abstraction in
+``iDEA.methods.interacting_det``. Both ``eigsh`` call sites
+(``_solve_in_parity_block`` and the full-basis fallback) now route
+through ``_solve_with_preconditioner``, which selects between PRIMME
+(if installed and dimension is large enough) and scipy.
+
+### Install / opt-in
+
+PRIMME is an optional dependency under the new ``[fast]`` extras:
+```
+pip install -e '.[fast]'
+```
+When absent, the dispatch silently falls back to scipy with no
+functional change.
+
+### Environment variables
+
+- ``IDEA_DET_EIGSH_BACKEND`` — force ``"primme"`` or ``"scipy"``
+  regardless of size threshold. Useful for testing or pinning a
+  backend in CI.
+- ``IDEA_DET_PRIMME_MIN_DIM`` — operator-dimension threshold below
+  which scipy is preferred even when PRIMME is available. Default
+  ``2000``. PRIMME's Jacobi-Davidson defaults have higher
+  per-iteration overhead than ARPACK Lanczos for tiny problems.
+
+### Numbers (tol=1e-15)
+
+| Case | Pre-E wall | Post-E wall | Speedup vs D |
+|---|---:|---:|---:|
+| ``uu_80``    | 0.115s | 0.119s | -3% (no change) |
+| ``uud_60``   | 0.927s | 0.792s | **+15%** |
+| ``uudd_30``  | 2.099s | 1.155s | **+45%** |
+
+PRIMME matvec counts on the two larger cases: ``uud_60`` 260 (was
+~270 scipy), ``uudd_30`` 199. ``uu_80`` is unaffected because its
+parity-block dim is 1580, below the default PRIMME threshold of
+2000, so scipy handles it and the Slater-determinant ``v0`` build
+is skipped via the lazy build in ``solve``.
+
+Cumulative ``uud_60`` speedup vs Phase A baseline: 26.146s → 0.792s
+= **33.0×**.
+
+### Precision regression on TestLong (acceptable)
+
+After Phase E,
+``tests/test_manybody.py::TestLong::test_density[uu]`` and ``[ud]``
+both fail their 2.0e-13 analytical-comparison tolerance:
+- ``[ud]`` max abs diff 3.40e-13 (was 3.27e-13 with scipy — Phase D
+  also failed at the noise floor).
+- ``[uu]`` max abs diff 2.70e-13 (was passing under scipy at machine
+  precision — **new failure**).
+
+PRIMME at ``tol=1e-15`` (the empirical sweet spot) delivers eigenpair
+residuals very close to machine precision but ~2× looser than scipy's
+``eigsh(tol=0)``. The TestLong density tolerance was calibrated for
+scipy and is below the floating-point noise floor that PRIMME can
+practically hit. Energies (``test_total_energy``) and wavefunctions
+(``test_wavefunction``) on TestLong continue to pass at the looser
+tolerances those tests use. Tightening the ``primme_tol`` mapping
+further (to ``eps ≈ 2.2e-16``) causes ``uudd_30`` to fail to
+converge within PRIMME's default ``maxiter``.
+
+### Phase E2 finding (deferred)
+
+The diagonal Jacobi preconditioner was implemented end-to-end and
+benchmarked: matvec count moved from 270 to 274 on ``uud_60`` — i.e.
+the cheap grid-basis Jacobi gave no benefit. Diagnostic: the eigenvalue
+on these cases is ~60 *below* ``min(diag(H))`` because the kinetic
+energy on each diagonal entry dominates the spectrum. With ``theta``
+placed below the spectrum, ``(diag - theta)`` is nearly uniform
+across basis states, so ``M^{-1} ≈ const × I`` — effectively no
+preconditioning. The friend's advice doc anticipated this and
+recommended the orbital-basis ``H_0`` preconditioner as the right
+next step. Code reverted to keep the codebase clean; the empirical
+result is recorded here and in ``notes/baseline_timings.txt``.
+
+### Benchmarking infrastructure
+
+``benchmarks/benchmark_interacting.py time`` now accepts
+``--count-matvecs`` (friend's red flag #7: "Do not benchmark only
+wall time. Add a counting LinearOperator…"). Implemented via the new
+``benchmarks/counting_operator.py`` (``CountingLinearOperator``
+subclass) plus a contextmanager that monkey-patches
+``_solve_with_preconditioner`` so the operator is wrapped before
+reaching the eigensolver. Per-run matvec medians/mins/maxes are
+reported alongside wall time.

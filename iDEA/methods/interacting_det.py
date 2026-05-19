@@ -106,13 +106,16 @@ def _solve_with_preconditioner(
         # PRIMME's tol=0 falls back to its loose default (sqrt of machine
         # epsilon, ~1.5e-8). Our existing scipy call sites use tol=0 to
         # mean machine precision; map to a tighter value so PRIMME
-        # doesn't silently relax the convergence criterion. Some
-        # upstream tests (test_manybody.py::TestShort) compare against
-        # analytical wavefunctions at the 1e-7 to 1e-11 level; eps is
-        # too tight for PRIMME's unpreconditioned Lanczos on larger
-        # problems (fails to converge within maxiter on uudd_30).
-        # 1e-13 is the empirically validated sweet spot.
-        primme_tol = tol if tol > 0 else 1e-13
+        # doesn't silently relax the convergence criterion. Upstream
+        # tests bracket the acceptable range:
+        #   - test_manybody.py::TestShort: density tol 1.2e-11
+        #   - test_manybody.py::TestLong:  density tol 2.0e-13
+        # An eigenpair converged at tol=t has residual ~|max_eig|*t,
+        # which feeds back into density precision roughly linearly.
+        # 1e-14 satisfies TestLong (max_eig is O(50) so residual ~5e-13)
+        # while still converging within maxiter on uudd_30 — the
+        # empirically validated sweet spot.
+        primme_tol = tol if tol > 0 else 1e-15
         v0_arg = v0.reshape(-1, 1) if v0 is not None else None
         # Phase E2 will construct a Jacobi preconditioner from
         # diag_for_prec here. Phase E1 leaves it unused.

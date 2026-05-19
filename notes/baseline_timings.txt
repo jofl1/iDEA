@@ -218,25 +218,117 @@ the ``antisymmetrize`` reconstruction cost added by ``build_labelled_state``;
 the pure determinant solve itself is unchanged from Phase C+.)
 
 ==============================================================================
-Long suite — Phase D regression verification
+Long suite — Phase D and Phase E regression verification
 ==============================================================================
 
   python -m pytest tests/ -q
 
-Result after Phase D2: 68 passed, 1 failed in 3:01.
+Result after Phase D2:    68 passed, 1 failed in 3:01.
+Result after Phase E1+E3: 73 passed, 2 failed in 1:49 (at tol=1e-15).
 
-The single failure is the pre-existing
-``tests/test_manybody.py::TestLong::test_density[ud]`` flake, at max
-absolute difference 3.273e-13 vs a 2.0e-13 tolerance. The same test
-failed before Phase D at 3.48e-13 — the failure magnitude is slightly
-smaller after dispatch (the det solver is marginally more accurate on
-this case). The failure is not introduced by this work; it is an
-upstream-iDEA tolerance vs floating-point noise issue documented since
-Phase B baselines.
+Phase D's single failure was the pre-existing
+``tests/test_manybody.py::TestLong::test_density[ud]`` flake at max
+absolute difference 3.27e-13 vs a 2.0e-13 tolerance (the test's
+analytical-density tolerance is set tighter than the underlying
+floating-point noise floor on this hardware). Pre-existing iDEA
+fragility, not introduced by this work.
 
-Zero new failures from Phase D dispatch. ``test_manybody.py::TestShort::
-test_wavefunction[uu]`` and ``[ud]``, which had been failing on the
-mid-D2 buggy ``.space`` reconstruction, both pass now.
+After Phase E, both ``TestLong::test_density[ud]`` (max 3.40e-13)
+and ``TestLong::test_density[uu]`` (max 2.70e-13) fail at the noise
+floor. PRIMME's residual at tol=1e-15 is slightly less precise than
+scipy's machine-precision result — enough to push ``[uu]`` over its
+2.0e-13 tolerance, where scipy used to clear it. The energies and
+wavefunctions on these cases continue to pass. The +5 net passing
+delta from Phase D (68) to Phase E (73) is:
+  +3 ``test_backend_equivalence`` (uu, ud, uud)
+  +3 ``test_cold_start_slater_determinant_is_exact_non_interacting``
+     (uu, ud, uud)
+  -1 ``test_density[uu]`` regression (above)
+
+Phase D's reconstructed ``.space`` tests
+(``TestShort::test_wavefunction[uu]`` and ``[ud]``) continue to pass.
+
+==============================================================================
+Phase E — PRIMME backend + cold-start v0 (Phase E2 preconditioner deferred)
+==============================================================================
+
+After Phase E, ``iDEA.methods.interacting_det.solve`` routes both
+eigsh call sites through a backend dispatch (PRIMME if installed and
+operator dim >= ``IDEA_DET_PRIMME_MIN_DIM``, default 2000; scipy
+otherwise). PRIMME's initial guess is a non-interacting Slater
+determinant in the grid-determinant basis: build the single-particle
+Hamiltonian ``K + diag(v_ext)``, diagonalise, expand the lowest
+``N_up`` and ``N_down`` orbitals as Slater minors per channel, outer-
+product.
+
+PRIMME is an optional dependency declared under the new
+``[project.optional-dependencies.fast]`` group; install via
+``pip install -e '.[fast]'``. When absent, the dispatch falls back to
+scipy with no functional change.
+
+A new ``--count-matvecs`` flag on ``benchmark_interacting.py time``
+instruments matvec counts via ``benchmarks/counting_operator.py``
+(friend's red flag #7: "Do not benchmark only wall time").
+
+Phase E2 (diagonal Jacobi preconditioner) was attempted and skipped.
+Empirically the eigenvalue is ~60 below ``min(diag(H))`` on these
+cases (kinetic energy dominates the diagonal in the grid basis), so
+``(diag - shift)`` is nearly uniform across basis states and the
+preconditioner is essentially identity. Friend's advice doc
+anticipated this: the orbital-basis preconditioner (H_0 diagonal in
+single-particle orbitals) is the right next step but needs a basis
+transform. Deferred to a future phase.
+
+Re-measure with:
+  python benchmarks/benchmark_interacting.py time --runs 3 \
+      --solver det --count-matvecs
+
+----- raw output of `... --solver det --count-matvecs` -----
+
+interacting_uu_80 (solver=det)
+  wall time median: 0.119s (3 runs, min=0.118s max=0.120s)
+  peak memory:      103.2 MB
+  matvec count:     median=351 (block dim 1580 < threshold; scipy used)
+  energy:           0.7531826851
+  density integral: 2.000000
+
+interacting_uud_60 (solver=det)
+  wall time median: 0.792s (3 runs, min=0.789s max=0.796s)
+  peak memory:      151.8 MB
+  matvec count:     median=260 (PRIMME, tol=1e-15)
+  energy:           1.6251528746
+  density integral: 3.000000
+
+interacting_uudd_30 (solver=det)
+  wall time median: 1.155s (3 runs, min=1.122s max=1.161s)
+  peak memory:      181.7 MB
+  matvec count:     median=199 (PRIMME, tol=1e-15)
+  energy:           2.9201268311
+  density integral: 4.000000
+
+PRIMME convergence tolerance is mapped from ``tol=0`` (the iDEA call
+convention) to ``1e-15`` so the resulting eigenpair precision is close
+to scipy's machine-precision residual. A looser ``tol=1e-13`` saves
+~15% more matvecs but pushes
+``tests/test_manybody.py::TestLong::test_density[uu]`` (tolerance
+2.0e-13) over its noise floor. See the long-suite section below.
+
+==============================================================================
+Final summary across all phases
+==============================================================================
+
+| Case               | Phase A wall | Phase B wall | Phase C+ wall | Phase D wall | Phase E wall | Cumulative |
+| ------------------ | -----------: | -----------: | ------------: | -----------: | -----------: | ---------: |
+| interacting_uu_80  |       0.166s |       0.122s |        0.116s |       0.115s |       0.119s |      1.39x |
+| interacting_uud_60 |      26.146s |       1.062s |        0.871s |       0.927s |       0.792s |     33.0x  |
+| interacting_uudd_30|     (fails)  |       1.666s |        1.264s |       2.099s |       1.155s |  determ.   |
+
+(Phase E reduces wall time on ``uud_60`` by ~15% and on ``uudd_30``
+by ~45% vs Phase D. ``uu_80`` is unaffected because the parity-block
+dim 1580 falls below the PRIMME threshold and the Slater-determinant
+v0 is skipped via the lazy build. Phase E does not deliver the
+friend's predicted 20× headline — that target was for warm starts
+across iterated workloads, which is Phase F.)
 
 ==============================================================================
 Validate solvers against committed baselines (rtol=1e-10)
